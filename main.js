@@ -27,6 +27,47 @@ const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
 const LOGO_LONG_PRESS_MS = 5000;
 const ALLOWED_RANGES = ["1h", "24h", "7d", "30d"];
 const RANGE_LABELS = { "1h": "1小时", "24h": "24小时", "7d": "7天", "30d": "30天" };
+const DEVICE_TYPE_OPTIONS = [
+  { value: "DeskLamp", label: "台灯" },
+  { value: "Monitor", label: "显示器" },
+  { value: "PC", label: "台式电脑" },
+  { value: "Laptop", label: "笔记本电脑" },
+  { value: "Router", label: "路由器" },
+  { value: "Fan", label: "风扇" },
+  { value: "Charger", label: "充电器" },
+  { value: "Phone", label: "手机充电" },
+  { value: "Kettle", label: "热水壶" },
+  { value: "HairDryer", label: "吹风机" },
+  { value: "Heater", label: "取暖器" },
+  { value: "AirConditioner", label: "空调" },
+  { value: "Fridge", label: "冰箱" },
+  { value: "Printer", label: "打印机" },
+  { value: "Projector", label: "投影仪" },
+  { value: "Speaker", label: "音箱" },
+  { value: "Other", label: "其他（自定义）" },
+];
+const DEVICE_TYPE_LABEL_MAP = DEVICE_TYPE_OPTIONS.reduce((acc, item) => {
+  acc[item.value] = item.label;
+  return acc;
+}, {});
+const TAB_META = {
+  home: {
+    label: "概览",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.8 12 4l9 7.8v8.2a1 1 0 0 1-1 1h-5.5v-6h-5v6H4a1 1 0 0 1-1-1z"/></svg>`,
+  },
+  device: {
+    label: "插排",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10a3 3 0 0 1 3 3v6a7 7 0 1 1-14 0V6a3 3 0 0 1 3-3m0 3v5h2V6zm8 0v5h2V6z"/></svg>`,
+  },
+  alerts: {
+    label: "告警",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 1.9 20.5A1 1 0 0 0 2.8 22h18.4a1 1 0 0 0 .9-1.5zM11 9h2v6h-2zm0 8h2v2h-2z"/></svg>`,
+  },
+  me: {
+    label: "我的",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5m0 2c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5"/></svg>`,
+  },
+};
 
 const app = document.getElementById("app");
 const offlineBanner = document.getElementById("offlineBanner");
@@ -138,15 +179,22 @@ function updateTopDeviceInfo() {
 
 function updateTabLabels() {
   const unresolvedCount = store.alerts.filter((a) => !a.resolved).length;
-  const labels = {
-    home: "概览",
-    device: "插排",
-    alerts: `告警${unresolvedCount ? `(${unresolvedCount})` : ""}`,
-    me: "我的",
-  };
   tabs.forEach((tab) => {
     const id = tab.dataset.tab;
-    tab.textContent = labels[id] || tab.textContent;
+    const meta = TAB_META[id];
+    if (!meta) return;
+    const badge =
+      id === "alerts" && unresolvedCount > 0
+        ? `<span class="tab-badge">${unresolvedCount > 99 ? "99+" : unresolvedCount}</span>`
+        : "";
+    tab.innerHTML = `
+      <span class="tab-inner">
+        <span class="tab-icon">${meta.icon}</span>
+        <span class="tab-label">${meta.label}</span>
+        ${badge}
+      </span>
+    `;
+    tab.setAttribute("aria-label", id === "alerts" && unresolvedCount > 0 ? `告警，${unresolvedCount}条未处理` : meta.label);
   });
 }
 
@@ -517,17 +565,73 @@ function telemetryChart() {
   `;
 }
 
+function normalizeDeviceTypeName(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return "";
+  if (raw === "Unknown") return "";
+
+  const mapped = DEVICE_TYPE_OPTIONS.find((x) => x.value === raw || x.label === raw);
+  if (mapped && mapped.value !== "Other") return mapped.value;
+
+  const cleaned = raw
+    .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!cleaned) return "";
+  if (/^[A-Za-z]/.test(cleaned)) return cleaned;
+  return `Device_${cleaned}`;
+}
+
+function readableDeviceType(device) {
+  const name = String(device || "").trim();
+  if (!name || name === "Unknown" || name === "None") return "未识别";
+  return DEVICE_TYPE_LABEL_MAP[name] ? `${DEVICE_TYPE_LABEL_MAP[name]} (${name})` : name;
+}
+
+function typeSelectOptionsHtml(currentValue = "") {
+  const normalizedCurrent = normalizeDeviceTypeName(currentValue);
+  return DEVICE_TYPE_OPTIONS.map((item) => {
+    const selected =
+      (normalizedCurrent && item.value === normalizedCurrent) || (!normalizedCurrent && item.value === "Other");
+    return `<option value="${item.value}" ${selected ? "selected" : ""}>${item.label} / ${item.value}</option>`;
+  }).join("");
+}
+
 function socketCardHtml(socket) {
   const targetKey = `${store.selectedDeviceId}:${socket.id}:switch`;
   const pending = store.pendingCmdByTarget.has(targetKey);
   const highPower = Number(socket.power_w || 0) >= POWER_ALERT_THRESHOLD;
   const status = pending ? "执行中" : socket.on ? "开启" : "关闭";
+  const currentType = String(socket.device || "Unknown");
+  const unknownType = !currentType || currentType === "Unknown" || currentType === "None";
+  const pendingId = Number.isFinite(Number(socket.pendingId)) ? Number(socket.pendingId) : null;
+  const showLearnPanel = unknownType || pendingId !== null;
+  const normalizedCurrentType = normalizeDeviceTypeName(currentType);
 
   return `
     <div class="socket-card ${socket.on ? "on" : "off"} ${pending ? "pending" : ""} ${highPower ? "high" : ""}">
       <div class="socket-title"><strong>插孔 ${socket.id}</strong><span class="socket-state">${status}</span></div>
       <div class="socket-power">${Number(socket.power_w || 0).toFixed(1)}<span>W</span></div>
-      <div class="small">设备：${socket.device || "未命名"}</div>
+      <div class="small">设备：${readableDeviceType(currentType)}</div>
+      <div class="small">识别状态：${unknownType ? "未识别" : "已识别"}</div>
+      <div class="row socket-ops">
+        <button data-socket-correct="${socket.id}" class="btn socket-correct" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>重识别</button>
+      </div>
+      ${
+        showLearnPanel
+          ? `
+      <div class="learn-panel">
+        <div class="small">设备类型提交${pendingId !== null ? `（pendingId: ${pendingId}）` : ""}</div>
+        <select class="input socket-type-select" data-socket="${socket.id}">
+          ${typeSelectOptionsHtml(normalizedCurrentType)}
+        </select>
+        <input class="input socket-type-custom" data-socket="${socket.id}" placeholder="自定义类型（如 Reading_Lamp）" />
+        <button data-socket-learn="${socket.id}" data-pending-id="${pendingId ?? ""}" class="btn primary socket-learn-submit" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>提交类型</button>
+      </div>
+      `
+          : ""
+      }
       <button data-socket="${socket.id}" data-action="${socket.on ? "off" : "on"}" class="btn ${socket.on ? "danger" : "primary"} socket-toggle" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>
         ${pending ? "执行中..." : socket.on ? "关闭" : "开启"}
       </button>
@@ -555,6 +659,8 @@ function eventTypeLabel(type) {
     CONFIG: "配置",
     OFFLINE: "离线",
     CONTROL_FAIL: "控制失败",
+    CORRECT: "重识别",
+    LEARN: "类型提交",
   };
   return mapping[type] || type || "事件";
 }
@@ -862,6 +968,54 @@ function bindActions() {
       const action = btn.dataset.action;
       const key = `${store.selectedDeviceId}:${socketId}:switch`;
       await executeCmd({ socket: socketId, action }, key);
+      await bootstrapData();
+    });
+  });
+
+  document.querySelectorAll(".socket-correct").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const socketId = Number(btn.dataset.socketCorrect);
+      if (!Number.isFinite(socketId)) return;
+      const key = `${store.selectedDeviceId}:${socketId}:correct`;
+      const result = await executeCmd({ socket: socketId, action: "correct" }, key);
+      if (result.state === "success") {
+        addEvent("CORRECT", `插孔${socketId} 已下发重识别`);
+        showToast(`插孔${socketId} 已下发重识别`);
+      } else {
+        addAlert("CONTROL_FAIL", `插孔${socketId} 重识别失败`, "warn");
+      }
+      await bootstrapData();
+    });
+  });
+
+  document.querySelectorAll(".socket-learn-submit").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const socketId = Number(btn.dataset.socketLearn);
+      if (!Number.isFinite(socketId)) return;
+
+      const select = document.querySelector(`.socket-type-select[data-socket="${socketId}"]`);
+      const customInput = document.querySelector(`.socket-type-custom[data-socket="${socketId}"]`);
+      const pick = select ? String(select.value || "").trim() : "";
+      const custom = customInput ? String(customInput.value || "").trim() : "";
+
+      const typeName = pick === "Other" ? normalizeDeviceTypeName(custom) : normalizeDeviceTypeName(pick || custom);
+      if (!typeName) {
+        showToast("请先选择或输入设备类型");
+        return;
+      }
+
+      const rawPendingId = btn.dataset.pendingId;
+      const pendingId = Number.isFinite(Number(rawPendingId)) ? Number(rawPendingId) : null;
+      const payload = pendingId !== null ? { pendingId, name: typeName } : { name: typeName };
+      const key = `${store.selectedDeviceId}:${socketId}:learn_commit`;
+
+      const result = await executeCmd({ socket: socketId, action: "learn_commit", payload }, key);
+      if (result.state === "success") {
+        addEvent("LEARN", `插孔${socketId} 类型已提交: ${typeName}`);
+        showToast(`插孔${socketId} 已提交类型`);
+      } else {
+        addAlert("CONTROL_FAIL", `插孔${socketId} 提交类型失败`, "warn");
+      }
       await bootstrapData();
     });
   });
