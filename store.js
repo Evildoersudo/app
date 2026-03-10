@@ -1,7 +1,8 @@
 export const store = {
   token: localStorage.getItem("dp_token") || "",
   user: null,
-  selectedDeviceId: "A-302-strip01",
+  selectedDeviceId: localStorage.getItem("dp_selected_device_id") || "",
+  telemetryRange: localStorage.getItem("dp_telemetry_range") || "1h",
   devices: [],
   deviceStatus: null,
   telemetry: [],
@@ -48,4 +49,18 @@ export function setToken(token) {
 export function setDebugMode(enabled) {
   store.debugMode = Boolean(enabled);
   localStorage.setItem("dp_debug_mode", store.debugMode ? "1" : "0");
+}
+
+export function setSelectedDeviceId(deviceId) {
+  store.selectedDeviceId = deviceId || "";
+  if (store.selectedDeviceId) {
+    localStorage.setItem("dp_selected_device_id", store.selectedDeviceId);
+  } else {
+    localStorage.removeItem("dp_selected_device_id");
+  }
+}
+
+export function setTelemetryRange(range) {
+  store.telemetryRange = range || "1h";
+  localStorage.setItem("dp_telemetry_range", store.telemetryRange);
 }

@@ -18,6 +18,7 @@ body {
   font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   background: #f5f7fa;
   color: var(--text);
+  min-height: 100vh;
 }
 
 .top-bar {
@@ -126,7 +127,7 @@ body {
 }
 
 main {
-  padding: 12px 12px 80px;
+  padding: 12px 12px calc(80px + env(safe-area-inset-bottom));
 }
 
 .card {
@@ -211,6 +212,8 @@ main {
   padding: 10px 12px;
   background: #fff;
   margin: 6px 0;
+  color: var(--text);
+  appearance: none;
 }
 
 .btn {
@@ -361,6 +364,7 @@ main {
   border-top: 1px solid #dbeafe;
   background: rgba(255, 255, 255, 0.95);
   backdrop-filter: blur(8px);
+  padding-bottom: env(safe-area-inset-bottom);
 }
 
 .tab {
@@ -373,4 +377,11 @@ main {
 .tab.active {
   color: #1677ff;
   font-weight: 700;
+}
+
+.btn:focus-visible,
+.tab:focus-visible,
+.input:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
 }
