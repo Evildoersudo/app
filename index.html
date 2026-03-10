@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0c4a6e" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="data:," />
+    <title>Dorm Power 学生端</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="top-bar">
+      <div class="top-left">
+        <h1 class="top-logo">Dorm Power</h1>
+        <div id="topDeviceInfo" class="top-device">当前设备</div>
+      </div>
+      <div id="onlineBadge" class="status-pill"><span class="pulse-dot warn"></span>未连接</div>
+    </header>
+
+    <div id="offlineBanner" class="offline-banner hidden"></div>
+    <div id="toast" class="toast hidden"></div>
+
+    <main id="app"></main>
+
+    <nav class="tab-bar">
+      <button data-tab="home" class="tab active">概览</button>
+      <button data-tab="device" class="tab">插排</button>
+      <button data-tab="alerts" class="tab">告警</button>
+      <button data-tab="me" class="tab">我的</button>
+    </nav>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

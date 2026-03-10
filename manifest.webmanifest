@@ -1,0 +1,10 @@
+{
+  "name": "Dorm Power 学生端",
+  "short_name": "DormPower",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f4f8fb",
+  "theme_color": "#0c4a6e",
+  "lang": "zh-CN",
+  "icons": []
+}
