@@ -1,4 +1,4 @@
-const CACHE_NAME = "dorm-power-app-shell-v3";
+const CACHE_NAME = "dorm-power-app-shell-v4";
 const APP_SHELL = ["./", "./index.html", "./styles.css", "./main.js", "./api.js", "./store.js", "./manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
@@ -53,4 +53,41 @@ self.addEventListener("fetch", (event) => {
         .catch(() => caches.match(req)),
     );
   }
+});
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = {};
+  }
+  const title = payload.title || "Dorm Power";
+  const options = {
+    body: payload.body || "你有新的通知",
+    tag: payload.tag || "dorm-power",
+    data: {
+      url: payload.url || "/app/index.html",
+    },
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const targetUrl = event.notification?.data?.url || "/app/index.html";
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((windowClients) => {
+      for (const client of windowClients) {
+        if ("focus" in client) {
+          client.navigate(targetUrl);
+          return client.focus();
+        }
+      }
+      if (clients.openWindow) {
+        return clients.openWindow(targetUrl);
+      }
+      return null;
+    }),
+  );
 });

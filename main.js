@@ -10,6 +10,9 @@
   sendCmd,
   getCmd,
   getHealth,
+  getPushPublicKey,
+  subscribePush,
+  unsubscribePush,
 } from "./api.js";
 import {
   store,
@@ -147,6 +150,57 @@ function showToast(msg, duration = 1800) {
   toastNode.classList.remove("hidden");
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastNode.classList.add("hidden"), duration);
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i += 1) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
+async function ensurePushSubscription() {
+  if (!store.token) return;
+  if (!("Notification" in window) || !("serviceWorker" in navigator)) return;
+  if (location.protocol !== "https:" && location.hostname !== "localhost") return;
+
+  let permission = Notification.permission;
+  if (permission === "default") {
+    permission = await Notification.requestPermission();
+  }
+  if (permission !== "granted") return;
+
+  const keyResp = await getPushPublicKey(store.token);
+  const publicKey = String(keyResp?.publicKey || "").trim();
+  if (!publicKey) return;
+
+  const registration = await navigator.serviceWorker.ready;
+  const existing = await registration.pushManager.getSubscription();
+  let subscription = existing;
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+  }
+  await subscribePush(subscription.toJSON(), store.token);
+}
+
+async function removePushSubscription(token) {
+  if (!token || !("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription();
+    if (!subscription) return;
+    await unsubscribePush(subscription.endpoint, token);
+    await subscription.unsubscribe();
+  } catch {
+    // noop
+  }
 }
 
 function updateBadge() {
@@ -906,6 +960,11 @@ function bindLogin() {
       showToast("登录成功");
       connectWs();
       await bootstrapData();
+      try {
+        await ensurePushSubscription();
+      } catch {
+        // do not block login flow
+      }
     } catch (e) {
       if (handleAuthExpired(e)) return;
       addAlert("SYSTEM", `登录失败：${e.message}`, "err");
@@ -1092,7 +1151,9 @@ function bindActions() {
 
   const logoutBtn = document.getElementById("logoutBtn");
   if (logoutBtn) {
-    logoutBtn.onclick = () => {
+    logoutBtn.onclick = async () => {
+      const oldToken = store.token;
+      await removePushSubscription(oldToken);
       clearSessionAndRender("已退出登录");
     };
   }
@@ -1166,6 +1227,11 @@ async function init() {
   if (store.token) {
     connectWs();
     await bootstrapData();
+    try {
+      await ensurePushSubscription();
+    } catch {
+      // noop
+    }
   }
   render();
 }

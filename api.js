@@ -101,6 +101,25 @@ export async function getHealth() {
   return apiFetch("/health");
 }
 
+export async function getPushPublicKey(token) {
+  return apiFetch("/api/push/public_key", { token });
+}
+
+export async function subscribePush(subscription, token) {
+  return apiFetch("/api/push/subscribe", {
+    method: "POST",
+    body: subscription,
+    token,
+  });
+}
+
+export async function unsubscribePush(endpoint, token) {
+  return apiFetch(`/api/push/subscribe?endpoint=${encodeURIComponent(endpoint)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
 function normalizeApiBase(value) {
   return String(value || DEFAULT_API_BASE).trim().replace(/\/+$/, "");
 }
