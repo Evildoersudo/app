@@ -163,20 +163,26 @@ function urlBase64ToUint8Array(base64String) {
   return outputArray;
 }
 
-async function ensurePushSubscription() {
-  if (!store.token) return;
-  if (!("Notification" in window) || !("serviceWorker" in navigator)) return;
-  if (location.protocol !== "https:" && location.hostname !== "localhost") return;
+async function ensurePushSubscription({ interactive = false } = {}) {
+  if (!store.token) return { ok: false, reason: "NO_TOKEN" };
+  if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    return { ok: false, reason: "UNSUPPORTED" };
+  }
+  if (location.protocol !== "https:" && location.hostname !== "localhost") {
+    return { ok: false, reason: "NOT_HTTPS" };
+  }
 
   let permission = Notification.permission;
-  if (permission === "default") {
+  if (permission === "default" && interactive) {
     permission = await Notification.requestPermission();
   }
-  if (permission !== "granted") return;
+  if (permission !== "granted") {
+    return { ok: false, reason: `PERMISSION_${permission}` };
+  }
 
   const keyResp = await getPushPublicKey(store.token);
   const publicKey = String(keyResp?.publicKey || "").trim();
-  if (!publicKey) return;
+  if (!publicKey) return { ok: false, reason: "NO_PUBLIC_KEY" };
 
   const registration = await navigator.serviceWorker.ready;
   const existing = await registration.pushManager.getSubscription();
@@ -188,6 +194,7 @@ async function ensurePushSubscription() {
     });
   }
   await subscribePush(subscription.toJSON(), store.token);
+  return { ok: true };
 }
 
 async function removePushSubscription(token) {
@@ -715,6 +722,7 @@ function eventTypeLabel(type) {
     CONTROL_FAIL: "控制失败",
     CORRECT: "重识别",
     LEARN: "类型提交",
+    PUSH: "推送",
   };
   return mapping[type] || type || "事件";
 }
@@ -892,6 +900,10 @@ function renderMe() {
       <h3>通知设置</h3>
       <label class="small"><input id="nightNotify" type="checkbox" checked /> 夜间提醒</label><br />
       <label class="small"><input id="overPowerNotify" type="checkbox" checked /> 超功率提醒</label>
+      <div class="row" style="margin-top:8px;">
+        <button id="enablePushBtn" class="btn primary">开启手机推送</button>
+      </div>
+      <p class="small">推送权限：${typeof Notification !== "undefined" ? Notification.permission : "unsupported"}</p>
     </section>
     ${store.debugMode
       ? `
@@ -961,7 +973,8 @@ function bindLogin() {
       connectWs();
       await bootstrapData();
       try {
-        await ensurePushSubscription();
+        const result = await ensurePushSubscription({ interactive: false });
+        if (!result.ok) addEvent("PUSH", `自动订阅未开启：${result.reason}`, "warn");
       } catch {
         // do not block login flow
       }
@@ -1149,6 +1162,26 @@ function bindActions() {
       });
   }
 
+  const enablePushBtn = document.getElementById("enablePushBtn");
+  if (enablePushBtn) {
+    enablePushBtn.onclick = async () => {
+      try {
+        const result = await ensurePushSubscription({ interactive: true });
+        if (result.ok) {
+          addEvent("PUSH", "推送订阅成功");
+          showToast("推送已开启");
+        } else {
+          addEvent("PUSH", `推送未开启：${result.reason}`, "warn");
+          showToast(`推送未开启：${result.reason}`);
+        }
+      } catch (e) {
+        addEvent("PUSH", `推送开启失败：${e.message || e}`, "err");
+        showToast("推送开启失败");
+      }
+      render();
+    };
+  }
+
   const logoutBtn = document.getElementById("logoutBtn");
   if (logoutBtn) {
     logoutBtn.onclick = async () => {
@@ -1228,7 +1261,8 @@ async function init() {
     connectWs();
     await bootstrapData();
     try {
-      await ensurePushSubscription();
+      const result = await ensurePushSubscription({ interactive: false });
+      if (!result.ok) addEvent("PUSH", `自动订阅未开启：${result.reason}`, "warn");
     } catch {
       // noop
     }
