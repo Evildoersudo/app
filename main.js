@@ -180,21 +180,25 @@ async function ensurePushSubscription({ interactive = false } = {}) {
     return { ok: false, reason: `PERMISSION_${permission}` };
   }
 
-  const keyResp = await getPushPublicKey(store.token);
-  const publicKey = String(keyResp?.publicKey || "").trim();
-  if (!publicKey) return { ok: false, reason: "NO_PUBLIC_KEY" };
+  try {
+    const keyResp = await getPushPublicKey(store.token);
+    const publicKey = String(keyResp?.publicKey || "").trim();
+    if (!publicKey) return { ok: false, reason: "NO_PUBLIC_KEY" };
 
-  const registration = await navigator.serviceWorker.ready;
-  const existing = await registration.pushManager.getSubscription();
-  let subscription = existing;
-  if (!subscription) {
-    subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(publicKey),
-    });
+    const registration = await navigator.serviceWorker.ready;
+    const existing = await registration.pushManager.getSubscription();
+    let subscription = existing;
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+    }
+    await subscribePush(subscription.toJSON(), store.token);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: `SUBSCRIBE_FAILED:${err?.message || err}` };
   }
-  await subscribePush(subscription.toJSON(), store.token);
-  return { ok: true };
 }
 
 async function removePushSubscription(token) {
@@ -1176,7 +1180,7 @@ function bindActions() {
         }
       } catch (e) {
         addEvent("PUSH", `推送开启失败：${e.message || e}`, "err");
-        showToast("推送开启失败");
+        showToast(`推送开启失败：${e.message || e}`, 2600);
       }
       render();
     };
