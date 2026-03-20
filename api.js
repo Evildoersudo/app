@@ -98,7 +98,19 @@ export async function getCmd(cmdId, token) {
 }
 
 export async function getHealth() {
-  return apiFetch("/health");
+  return apiFetch("/api/health");
+}
+
+export async function getMailSetting(token) {
+  return apiFetch("/api/mail/setting", { token });
+}
+
+export async function updateMailSetting(enabled, token) {
+  return apiFetch("/api/mail/setting", {
+    method: "POST",
+    body: { enabled },
+    token,
+  });
 }
 
 function normalizeApiBase(value) {

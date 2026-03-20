@@ -10,6 +10,8 @@
   sendCmd,
   getCmd,
   getHealth,
+  getMailSetting,
+  updateMailSetting,
 } from "./api.js";
 import {
   store,
@@ -87,6 +89,7 @@ let toastTimer = null;
 let logoPressTimer = null;
 let globalBusy = false;
 let bootstrapSeq = 0;
+let mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
 
 const cmdWaiters = new Map();
 
@@ -211,6 +214,7 @@ function clearSessionAndRender(tip = "登录已过期，请重新登录") {
   store.telemetry = [];
   store.devices = [];
   store.selectedDeviceId = "";
+  mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
   try {
     if (store.wsClient) store.wsClient.close();
   } catch {
@@ -225,6 +229,32 @@ function handleAuthExpired(error, tip = "登录已过期，请重新登录") {
   if (!error || error.status !== 401 || !store.token) return false;
   clearSessionAndRender(tip);
   return true;
+}
+
+async function refreshMailPreference() {
+  if (!store.token) {
+    mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
+    return;
+  }
+  try {
+    const result = await getMailSetting(store.token);
+    mailPreference = {
+      enabled: Boolean(result?.enabled),
+      serviceEnabled: Boolean(result?.serviceEnabled),
+      smtpConfigured: Boolean(result?.smtpConfigured),
+      email: String(result?.email || store.user?.email || ""),
+      loaded: true,
+    };
+  } catch (err) {
+    if (handleAuthExpired(err)) return;
+    mailPreference = {
+      enabled: false,
+      serviceEnabled: false,
+      smtpConfigured: false,
+      email: store.user?.email || "",
+      loaded: true,
+    };
+  }
 }
 
 async function refreshTelemetryIfNeeded(force = false) {
@@ -258,6 +288,7 @@ async function bootstrapData() {
       store.deviceStatus = null;
       store.telemetry = [];
     }
+    await refreshMailPreference();
 
     if (!navigator.onLine) {
       setBanner("当前网络不可用，请检查连接后重试");
@@ -818,6 +849,15 @@ function renderMe() {
   const usageKwh = calcTodayUsageKwh();
   const weeklyKwh = Number((usageKwh * 7).toFixed(1));
   const nightRate = `${Math.min(80, Math.max(10, Math.round((usageKwh * 13) % 50 + 20)))}%`;
+  const mailStatus = !mailPreference.loaded
+    ? "加载中..."
+    : !mailPreference.smtpConfigured
+      ? "后端未配置 SMTP"
+      : !mailPreference.serviceEnabled
+        ? "管理员已关闭邮件服务"
+        : mailPreference.enabled
+          ? "邮件提醒已开启"
+          : "邮件提醒已关闭";
 
   return `
     <section class="card">
@@ -836,8 +876,13 @@ function renderMe() {
     </section>
     <section class="card">
       <h3>通知设置</h3>
-      <label class="small"><input id="nightNotify" type="checkbox" checked /> 夜间提醒</label><br />
-      <label class="small"><input id="overPowerNotify" type="checkbox" checked /> 超功率提醒</label>
+      <p class="small">接收邮箱：${mailPreference.email || store.user?.email || "-"}</p>
+      <p class="small">状态：${mailStatus}</p>
+      <div class="row">
+        <button id="toggleMailBtn" class="btn ${mailPreference.enabled ? "" : "primary"}" ${!mailPreference.loaded || !mailPreference.smtpConfigured ? "disabled" : ""}>
+          ${mailPreference.enabled ? "关闭邮件提醒" : "开启邮件提醒"}
+        </button>
+      </div>
     </section>
     ${store.debugMode
       ? `
@@ -1079,11 +1124,37 @@ function bindActions() {
     };
   }
 
+  const toggleMailBtn = document.getElementById("toggleMailBtn");
+  if (toggleMailBtn) {
+    toggleMailBtn.onclick = async () => {
+      if (!mailPreference.smtpConfigured) {
+        showToast("后端未配置 SMTP");
+        return;
+      }
+      try {
+        const result = await updateMailSetting(!mailPreference.enabled, store.token);
+        mailPreference = {
+          enabled: Boolean(result?.enabled),
+          serviceEnabled: Boolean(result?.serviceEnabled),
+          smtpConfigured: Boolean(result?.smtpConfigured),
+          email: String(result?.email || store.user?.email || ""),
+          loaded: true,
+        };
+        addEvent("CONFIG", `邮件提醒已${mailPreference.enabled ? "开启" : "关闭"}`);
+        showToast(mailPreference.enabled ? "邮件提醒已开启" : "邮件提醒已关闭");
+        render();
+      } catch (err) {
+        if (handleAuthExpired(err)) return;
+        showToast(`邮件提醒更新失败：${err.message}`);
+      }
+    };
+  }
+
   const healthInfo = document.getElementById("healthInfo");
   if (healthInfo) {
     getHealth()
       .then((h) => {
-        healthInfo.textContent = `后端=${h.ok ? "正常" : "异常"} | MQTT=${h.mqtt_connected ? "已连接" : "未连接"} | 数据库=${h.database_url || "-"}`;
+        healthInfo.textContent = `后端=${h.ok ? "正常" : "异常"} | MQTT=${h.mqtt_connected ? "已连接" : "未连接"} | SMTP=${h.smtp_ready ? "已配置" : "未配置"} | 数据库=${h.database_url || "-"}`;
       })
       .catch((e) => {
         healthInfo.textContent = `健康检查失败：${e.message}`;
