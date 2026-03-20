@@ -1,8 +1,12 @@
-const DEFAULT_API_BASE = "http://127.0.0.1:8000";
-const DEFAULT_WS_BASE = "ws://127.0.0.1:8000/ws";
+const DEFAULT_API_BASE =
+  typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8000";
+const DEFAULT_WS_BASE =
+  typeof window !== "undefined"
+    ? `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`
+    : "ws://127.0.0.1:8000/ws";
 
-let apiBase = normalizeApiBase(localStorage.getItem("dp_api_base") || DEFAULT_API_BASE);
-let wsBase = normalizeWsBase(localStorage.getItem("dp_ws_base") || DEFAULT_WS_BASE);
+let apiBase = normalizeApiBase(resolveStoredBase("dp_api_base", DEFAULT_API_BASE));
+let wsBase = normalizeWsBase(resolveStoredBase("dp_ws_base", DEFAULT_WS_BASE));
 
 export function getApiBase() {
   return apiBase;
@@ -111,6 +115,26 @@ export async function updateMailSetting(enabled, token) {
     body: { enabled },
     token,
   });
+}
+
+function resolveStoredBase(storageKey, fallback) {
+  if (typeof window === "undefined") return fallback;
+
+  const saved = String(localStorage.getItem(storageKey) || "").trim();
+  if (!saved) return fallback;
+
+  const debugMode = localStorage.getItem("dp_debug_mode") === "1";
+  if (debugMode) return saved;
+
+  try {
+    const savedUrl = new URL(saved);
+    if (savedUrl.origin === window.location.origin) return saved;
+  } catch {
+    // Ignore malformed stored values and fall back to current origin.
+  }
+
+  localStorage.removeItem(storageKey);
+  return fallback;
 }
 
 function normalizeApiBase(value) {
