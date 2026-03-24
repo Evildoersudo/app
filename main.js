@@ -90,6 +90,7 @@ let logoPressTimer = null;
 let globalBusy = false;
 let bootstrapSeq = 0;
 let mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
+const customTypeDraftBySocket = new Map();
 
 const cmdWaiters = new Map();
 
@@ -215,6 +216,7 @@ function clearSessionAndRender(tip = "登录已过期，请重新登录") {
   store.devices = [];
   store.selectedDeviceId = "";
   mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
+  customTypeDraftBySocket.clear();
   try {
     if (store.wsClient) store.wsClient.close();
   } catch {
@@ -639,6 +641,7 @@ function socketCardHtml(socket) {
   const pendingId = Number.isFinite(Number(socket.pendingId)) ? Number(socket.pendingId) : null;
   const showLearnPanel = unknownType || pendingId !== null;
   const normalizedCurrentType = normalizeDeviceTypeName(currentType);
+  const customDraft = String(customTypeDraftBySocket.get(socket.id) || "");
 
   return `
     <div class="socket-card ${socket.on ? "on" : "off"} ${pending ? "pending" : ""} ${highPower ? "high" : ""}">
@@ -657,7 +660,7 @@ function socketCardHtml(socket) {
         <select class="input socket-type-select" data-socket="${socket.id}">
           ${typeSelectOptionsHtml(normalizedCurrentType)}
         </select>
-        <input class="input socket-type-custom" data-socket="${socket.id}" placeholder="自定义类型（如 Reading_Lamp）" />
+        <input class="input socket-type-custom" data-socket="${socket.id}" value="${customDraft}" placeholder="自定义类型（如 Reading_Lamp）" />
         <button data-socket-learn="${socket.id}" data-pending-id="${pendingId ?? ""}" class="btn primary socket-learn-submit" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>提交类型</button>
       </div>
       `
@@ -1033,6 +1036,14 @@ function bindActions() {
     });
   });
 
+  document.querySelectorAll(".socket-type-custom").forEach((input) => {
+    input.addEventListener("input", () => {
+      const socketId = Number(input.dataset.socket);
+      if (!Number.isFinite(socketId)) return;
+      customTypeDraftBySocket.set(socketId, input.value || "");
+    });
+  });
+
   document.querySelectorAll(".socket-learn-submit").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const socketId = Number(btn.dataset.socketLearn);
@@ -1056,6 +1067,7 @@ function bindActions() {
 
       const result = await executeCmd({ socket: socketId, action: "learn_commit", payload }, key);
       if (result.state === "success") {
+        customTypeDraftBySocket.delete(socketId);
         addEvent("LEARN", `插孔${socketId} 类型已提交: ${typeName}`);
         showToast(`插孔${socketId} 已提交类型`);
       } else {
