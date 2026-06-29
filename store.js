@@ -6,6 +6,11 @@ export const store = {
   devices: [],
   deviceStatus: null,
   telemetry: [],
+  dailyCheckup: null,
+  behaviorEvents: [],
+  assistantReply: "",
+  assistantBusy: false,
+  alertPrefs: JSON.parse(localStorage.getItem("dp_alert_prefs") || "{}"),
   wsConnected: false,
   wsClient: null,
   events: [],
@@ -63,4 +68,9 @@ export function setSelectedDeviceId(deviceId) {
 export function setTelemetryRange(range) {
   store.telemetryRange = range || "1h";
   localStorage.setItem("dp_telemetry_range", store.telemetryRange);
+}
+
+export function setAlertPref(key, enabled) {
+  store.alertPrefs = { ...store.alertPrefs, [key]: Boolean(enabled) };
+  localStorage.setItem("dp_alert_prefs", JSON.stringify(store.alertPrefs));
 }

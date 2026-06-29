@@ -1,9 +1,7 @@
 const DEFAULT_API_BASE =
-  typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8000";
+  typeof window !== "undefined" ? resolveDefaultApiBase() : "http://127.0.0.1:8000";
 const DEFAULT_WS_BASE =
-  typeof window !== "undefined"
-    ? `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`
-    : "ws://127.0.0.1:8000/ws";
+  typeof window !== "undefined" ? resolveDefaultWsBase() : "ws://127.0.0.1:8000/ws";
 
 let apiBase = normalizeApiBase(resolveStoredBase("dp_api_base", DEFAULT_API_BASE));
 let wsBase = normalizeWsBase(resolveStoredBase("dp_ws_base", DEFAULT_WS_BASE));
@@ -89,6 +87,38 @@ export async function getTelemetry(deviceId, range = "1h", token) {
   return apiFetch(`/api/telemetry?device=${encodeURIComponent(deviceId)}&range=${encodeURIComponent(range)}`, { token });
 }
 
+export async function getDailyCheckup(roomId, deviceId, token) {
+  const qs = deviceId ? `?device=${encodeURIComponent(deviceId)}` : "";
+  return apiFetch(`/api/rooms/${encodeURIComponent(roomId)}/daily-checkup${qs}`, { token });
+}
+
+export async function getBehaviorEvents({ deviceId = "", roomId = "", limit = 50 } = {}, token) {
+  const params = new URLSearchParams();
+  if (deviceId) params.set("device", deviceId);
+  if (roomId) params.set("room", roomId);
+  params.set("limit", String(limit));
+  return apiFetch(`/api/behavior-events?${params.toString()}`, { token });
+}
+
+export async function postAgentQuery({ message, roomId = "", deviceId = "", page = "pwa", period = "7d" }, token) {
+  return apiFetch("/api/agent/query", {
+    method: "POST",
+    body: {
+      message,
+      roomId,
+      period,
+      context: {
+        page,
+        roomId,
+        deviceId,
+        timeRange: period,
+      },
+    },
+    token,
+    timeoutMs: 30000,
+  });
+}
+
 export async function sendCmd(deviceId, payload, token) {
   return apiFetch(`/api/strips/${encodeURIComponent(deviceId)}/cmd`, {
     method: "POST",
@@ -135,6 +165,22 @@ function resolveStoredBase(storageKey, fallback) {
 
   localStorage.removeItem(storageKey);
   return fallback;
+}
+
+function isLocalStaticDev() {
+  if (typeof window === "undefined") return false;
+  const host = window.location.hostname;
+  return (host === "127.0.0.1" || host === "localhost") && window.location.port && window.location.port !== "8000";
+}
+
+function resolveDefaultApiBase() {
+  if (isLocalStaticDev()) return `${window.location.protocol}//${window.location.hostname}:8000`;
+  return window.location.origin;
+}
+
+function resolveDefaultWsBase() {
+  if (isLocalStaticDev()) return `ws://${window.location.hostname}:8000/ws`;
+  return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`;
 }
 
 function normalizeApiBase(value) {

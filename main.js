@@ -1,4 +1,4 @@
-﻿import {
+import {
   getApiBase,
   getWsBase,
   setApiBase,
@@ -7,6 +7,9 @@
   getDevices,
   getDeviceStatus,
   getTelemetry,
+  getDailyCheckup,
+  getBehaviorEvents,
+  postAgentQuery,
   sendCmd,
   getCmd,
   getHealth,
@@ -21,14 +24,41 @@ import {
   setDebugMode,
   setSelectedDeviceId,
   setTelemetryRange,
+  setAlertPref,
 } from "./store.js";
 
-const POWER_ALERT_THRESHOLD = 120;
 const STATUS_POLL_INTERVAL_MS = 8000;
 const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
+const SUPPLEMENT_REFRESH_INTERVAL_MS = 20000;
 const LOGO_LONG_PRESS_MS = 5000;
 const ALLOWED_RANGES = ["1h", "24h", "7d", "30d"];
 const RANGE_LABELS = { "1h": "1小时", "24h": "24小时", "7d": "7天", "30d": "30天" };
+
+const BEHAVIOR_META = {
+  normal: { title: "正常用电", desc: "当前没有明显风险", tone: "ok" },
+  standby_waste: { title: "低功率待机", desc: "设备长时间低功率运行，可能存在待机耗电", tone: "warn" },
+  unknown_high_power: { title: "未知高功率", desc: "设备尚未识别且功率较高，需要确认类型", tone: "danger" },
+  long_high_power: { title: "长时间高负载", desc: "功率持续偏高，建议关注接入设备", tone: "danger" },
+  frequent_switching: { title: "频繁启停", desc: "插孔短时间内多次开关，可能存在异常操作", tone: "warn" },
+  protected_cutoff: { title: "保护断电", desc: "端侧已执行保护动作，请先确认现场情况", tone: "danger" },
+};
+
+const LEVEL_META = {
+  low: { title: "正常", tone: "ok" },
+  medium: { title: "需要关注", tone: "warn" },
+  high: { title: "高风险", tone: "danger" },
+};
+
+const REASON_BITS = [
+  [0x0001, "设备未识别或处于待学习状态"],
+  [0x0002, "当前功率达到高负载判断条件"],
+  [0x0004, "对应行为持续时间达到阈值"],
+  [0x0008, "低功率待机持续时间较长"],
+  [0x0010, "短时间内开关变化次数较多"],
+  [0x0020, "功率出现明显跳变"],
+  [0x0040, "策略允许并已执行保护断电"],
+];
+
 const DEVICE_TYPE_OPTIONS = [
   { value: "DeskLamp", label: "台灯" },
   { value: "Monitor", label: "显示器" },
@@ -48,21 +78,23 @@ const DEVICE_TYPE_OPTIONS = [
   { value: "Speaker", label: "音箱" },
   { value: "Other", label: "其他（自定义）" },
 ];
+
 const DEVICE_TYPE_LABEL_MAP = DEVICE_TYPE_OPTIONS.reduce((acc, item) => {
   acc[item.value] = item.label;
   return acc;
 }, {});
+
 const TAB_META = {
   home: {
-    label: "概览",
+    label: "首页",
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.8 12 4l9 7.8v8.2a1 1 0 0 1-1 1h-5.5v-6h-5v6H4a1 1 0 0 1-1-1z"/></svg>`,
   },
   device: {
-    label: "插排",
+    label: "插孔",
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10a3 3 0 0 1 3 3v6a7 7 0 1 1-14 0V6a3 3 0 0 1 3-3m0 3v5h2V6zm8 0v5h2V6z"/></svg>`,
   },
   alerts: {
-    label: "告警",
+    label: "提醒",
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 1.9 20.5A1 1 0 0 0 2.8 22h18.4a1 1 0 0 0 .9-1.5zM11 9h2v6h-2zm0 8h2v2h-2z"/></svg>`,
   },
   me: {
@@ -70,6 +102,15 @@ const TAB_META = {
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5m0 2c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5"/></svg>`,
   },
 };
+
+const ASSISTANT_QUESTIONS = [
+  "今天用电正常吗？",
+  "为什么提醒我？",
+  "为什么显示 Unknown？",
+  "为什么插座被保护断电？",
+  "哪些插孔可以关闭省电？",
+  "设备离线怎么办？",
+];
 
 const app = document.getElementById("app");
 const offlineBanner = document.getElementById("offlineBanner");
@@ -85,13 +126,13 @@ let wsRetryDelay = 1500;
 let statusPollTimer = null;
 let statusPolling = false;
 let lastTelemetryRefreshAt = 0;
+let lastSupplementRefreshAt = 0;
 let toastTimer = null;
 let logoPressTimer = null;
 let globalBusy = false;
 let bootstrapSeq = 0;
 let mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
 const customTypeDraftBySocket = new Map();
-
 const cmdWaiters = new Map();
 
 if (!ALLOWED_RANGES.includes(store.telemetryRange)) {
@@ -124,12 +165,33 @@ if (topLogo) {
   topLogo.addEventListener("pointercancel", clearPress);
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 function formatTime(ts) {
-  return new Date(ts).toLocaleString("zh-CN");
+  const ms = Number(ts || 0) > 10_000_000_000 ? Number(ts) : Number(ts || 0) * 1000;
+  return new Date(ms || Date.now()).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDuration(seconds) {
+  const s = Math.max(0, Number(seconds || 0));
+  if (s < 60) return `${Math.round(s)}秒`;
+  if (s < 3600) return `${Math.round(s / 60)}分钟`;
+  return `${(s / 3600).toFixed(1)}小时`;
 }
 
 function selectedDevice() {
   return store.devices.find((x) => x.id === store.selectedDeviceId) || null;
+}
+
+function selectedRoomId() {
+  return selectedDevice()?.room || "";
 }
 
 function isOnline() {
@@ -151,6 +213,79 @@ function showToast(msg, duration = 1800) {
   toastNode.classList.remove("hidden");
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastNode.classList.add("hidden"), duration);
+}
+
+function behaviorMeta(tag) {
+  return BEHAVIOR_META[tag] || { title: tag || "未知行为", desc: "端侧返回了新的行为标签，请以风险分和原因位为准", tone: "warn" };
+}
+
+function levelMeta(level) {
+  return LEVEL_META[level] || LEVEL_META.low;
+}
+
+function socketBehavior(socket = {}) {
+  return {
+    tag: String(socket.bt || "normal"),
+    score: Number(socket.bs || 0),
+    level: String(socket.bl || "low"),
+    reasonMask: Number(socket.bm || 0),
+    standbySeconds: Number(socket.stb || 0),
+    highPowerSeconds: Number(socket.hp || 0),
+    unknownSeconds: Number(socket.unk || 0),
+    switchCount: Number(socket.sw || 0),
+  };
+}
+
+function rootBehavior() {
+  const b = store.deviceStatus?.behavior || {};
+  return {
+    top: Number(b.top || 0),
+    tag: String(b.tag || "normal"),
+    risk: Number(b.risk || 0),
+    level: String(b.level || "low"),
+  };
+}
+
+function reasonTexts(mask, tag = "") {
+  const reasons = REASON_BITS.filter(([bit]) => Number(mask || 0) & bit).map(([, text]) => text);
+  if (!reasons.length) {
+    if (tag === "standby_waste") reasons.push("设备处于低功率待机状态");
+    if (tag === "unknown_high_power") reasons.push("设备未识别且功率较高");
+    if (tag === "protected_cutoff") reasons.push("端侧已执行保护断电");
+    if (tag === "long_high_power") reasons.push("高功率运行时间较长");
+    if (tag === "frequent_switching") reasons.push("短时间内开关变化较多");
+  }
+  return reasons;
+}
+
+function focusSocket() {
+  const sockets = store.deviceStatus?.sockets || [];
+  const b = rootBehavior();
+  if (b.top) return sockets.find((s) => Number(s.id) === b.top) || null;
+  return sockets
+    .slice()
+    .sort((a, b2) => Number(b2.bs || 0) - Number(a.bs || 0))[0] || null;
+}
+
+function riskTone() {
+  if (!isOnline()) return "offline";
+  return levelMeta(rootBehavior().level).tone;
+}
+
+function statusTitle() {
+  if (!store.selectedDeviceId) return "请选择设备";
+  if (!isOnline()) return "设备离线";
+  const b = rootBehavior();
+  if (b.risk <= 0 && b.tag === "normal") return "当前用电正常";
+  return `${levelMeta(b.level).title}：${behaviorMeta(b.tag).title}`;
+}
+
+function statusSubtitle() {
+  if (!store.selectedDeviceId) return "登录后选择或绑定智能插排。";
+  if (!isOnline()) return "暂时无法获取设备状态，0W 不代表设备已关闭。";
+  const socket = focusSocket();
+  if (!socket || Number(socket.bs || 0) <= 0) return "暂未发现需要立即处理的插孔。";
+  return `插孔 ${socket.id} ${behaviorMeta(socket.bt).title}，风险分 ${Number(socket.bs || 0)}。`;
 }
 
 function updateBadge() {
@@ -181,15 +316,21 @@ function updateTopDeviceInfo() {
   node.textContent = d ? `${d.room || "-"} / ${d.name || d.id}` : "请选择设备";
 }
 
+function unresolvedReminderCount() {
+  const behaviorCount = (store.behaviorEvents || []).filter((e) => e.level === "medium" || e.level === "high").length;
+  const localCount = store.alerts.filter((a) => !a.resolved).length;
+  return behaviorCount + localCount;
+}
+
 function updateTabLabels() {
-  const unresolvedCount = store.alerts.filter((a) => !a.resolved).length;
+  const count = unresolvedReminderCount();
   tabs.forEach((tab) => {
     const id = tab.dataset.tab;
     const meta = TAB_META[id];
     if (!meta) return;
     const badge =
-      id === "alerts" && unresolvedCount > 0
-        ? `<span class="tab-badge">${unresolvedCount > 99 ? "99+" : unresolvedCount}</span>`
+      id === "alerts" && count > 0
+        ? `<span class="tab-badge">${count > 99 ? "99+" : count}</span>`
         : "";
     tab.innerHTML = `
       <span class="tab-inner">
@@ -198,7 +339,6 @@ function updateTabLabels() {
         ${badge}
       </span>
     `;
-    tab.setAttribute("aria-label", id === "alerts" && unresolvedCount > 0 ? `告警，${unresolvedCount}条未处理` : meta.label);
   });
 }
 
@@ -213,6 +353,8 @@ function clearSessionAndRender(tip = "登录已过期，请重新登录") {
   store.wsConnected = false;
   store.deviceStatus = null;
   store.telemetry = [];
+  store.dailyCheckup = null;
+  store.behaviorEvents = [];
   store.devices = [];
   store.selectedDeviceId = "";
   mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
@@ -268,6 +410,35 @@ async function refreshTelemetryIfNeeded(force = false) {
   lastTelemetryRefreshAt = now;
 }
 
+async function refreshSupplementIfNeeded(force = false) {
+  if (!store.token || !store.selectedDeviceId) return;
+  const now = Date.now();
+  if (!force && now - lastSupplementRefreshAt < SUPPLEMENT_REFRESH_INTERVAL_MS) return;
+  const roomId = selectedRoomId();
+  const tasks = [
+    getBehaviorEvents({ deviceId: store.selectedDeviceId, limit: 50 }, store.token)
+      .then((events) => {
+        store.behaviorEvents = Array.isArray(events) ? events : [];
+      })
+      .catch((err) => {
+        if (!handleAuthExpired(err)) store.behaviorEvents = store.behaviorEvents || [];
+      }),
+  ];
+  if (roomId) {
+    tasks.push(
+      getDailyCheckup(roomId, store.selectedDeviceId, store.token)
+        .then((checkup) => {
+          store.dailyCheckup = checkup || null;
+        })
+        .catch((err) => {
+          if (!handleAuthExpired(err)) store.dailyCheckup = null;
+        }),
+    );
+  }
+  await Promise.all(tasks);
+  lastSupplementRefreshAt = now;
+}
+
 async function bootstrapData() {
   if (!store.token) return;
   const seq = ++bootstrapSeq;
@@ -276,9 +447,9 @@ async function bootstrapData() {
     if (seq !== bootstrapSeq) return;
     store.devices = Array.isArray(devices) ? devices : [];
 
-    const exists = store.devices.some((x) => x.id === store.selectedDeviceId);
-    if (!exists) {
-      setSelectedDeviceId(store.devices[0]?.id || "");
+    const boundDeviceId = store.devices[0]?.id || "";
+    if (store.selectedDeviceId !== boundDeviceId) {
+      setSelectedDeviceId(boundDeviceId);
     }
 
     if (store.selectedDeviceId) {
@@ -286,9 +457,12 @@ async function bootstrapData() {
       if (seq !== bootstrapSeq) return;
       store.deviceStatus = status || null;
       await refreshTelemetryIfNeeded(true);
+      await refreshSupplementIfNeeded(true);
     } else {
       store.deviceStatus = null;
       store.telemetry = [];
+      store.dailyCheckup = null;
+      store.behaviorEvents = [];
     }
     await refreshMailPreference();
 
@@ -318,15 +492,13 @@ function scheduleReconnect() {
 
 function connectWs() {
   if (!store.token) return;
-
   try {
     if (store.wsClient) store.wsClient.close();
   } catch {
     // noop
   }
 
-  const wsUrl = getWsBase();
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(getWsBase());
   store.wsClient = ws;
 
   ws.onopen = () => {
@@ -409,7 +581,6 @@ function waitWsAck(cmdId, timeoutMs = 3000) {
       cmdWaiters.delete(cmdId);
       resolve(null);
     }, timeoutMs);
-
     cmdWaiters.set(cmdId, (state) => {
       clearTimeout(timer);
       resolve(state);
@@ -437,8 +608,8 @@ async function pollCmdState(cmdId, maxMs = 5000, stepMs = 500) {
 
 async function executeCmd(payload, targetKey) {
   if (!isOnline()) {
-    addAlert("CONTROL_FAIL", "设备离线", "warn");
-    showToast("设备离线");
+    addAlert("CONTROL_FAIL", "设备离线，无法控制", "warn");
+    showToast("设备离线，无法控制");
     return { state: "failed" };
   }
   if (store.pendingCmdByTarget.has(targetKey)) {
@@ -452,10 +623,9 @@ async function executeCmd(payload, targetKey) {
     submit = await sendCmd(store.selectedDeviceId, payload, store.token);
   } catch (err) {
     if (handleAuthExpired(err)) return { state: "failed" };
-
     if (err.status === 409) {
       addAlert("CONTROL_FAIL", "命令冲突", "warn");
-      showToast("命令冲突：存在待执行命令");
+      showToast("存在待执行命令");
       const pendingCmdId = err.data?.details?.pendingCmdId || err.data?.pendingCmdId || null;
       if (pendingCmdId) {
         const finalState = await pollCmdState(pendingCmdId);
@@ -494,18 +664,22 @@ async function executeCmd(payload, targetKey) {
   return { state: pollState, cmdId };
 }
 
-async function executeBulkSocketAction(action) {
+async function executeBulkSocketAction(action, { label = "", strong = false } = {}) {
   const sockets = store.deviceStatus?.sockets || [];
   if (!sockets.length) return;
 
   const desiredOn = action === "on";
-  const targets = sockets.filter((s) => Boolean(s.on) !== desiredOn);
+  const targets = sockets.filter((s) => {
+    if (desiredOn && socketBehavior(s).tag === "protected_cutoff") return false;
+    return Boolean(s.on) !== desiredOn;
+  });
   if (!targets.length) {
     showToast("无需变更");
     return;
   }
 
-  const ok = window.confirm(`将逐个插孔执行 ${targets.length} 条命令，确认继续吗？`);
+  const msg = label || `将逐个插孔执行 ${targets.length} 条命令，确认继续吗？`;
+  const ok = strong ? window.confirm(`${msg}\n\n请确认现场安全后再继续。`) : window.confirm(msg);
   if (!ok) return;
 
   setGlobalBusy(true);
@@ -521,36 +695,31 @@ async function executeBulkSocketAction(action) {
   }
   setGlobalBusy(false);
   await bootstrapData();
-  showToast(`批量完成：成功 ${successCount}，失败 ${failCount}`, 2600);
+  showToast(`完成：成功 ${successCount}，失败 ${failCount}`, 2600);
 }
 
-function calcTodayUsageKwh() {
+function calcUsageKwhFromTelemetry() {
   const points = store.telemetry;
   if (points.length < 2) return 0;
-  const avgPower = points.reduce((sum, p) => sum + Number(p.power_w || 0), 0) / points.length;
-
-  if (store.telemetryRange === "1h") {
-    return Number((avgPower / 1000).toFixed(2));
+  const sorted = points
+    .map((p) => ({ ts: Number(p.ts || 0), power: Math.max(0, Number(p.power_w || 0)) }))
+    .filter((p) => p.ts > 0)
+    .sort((a, b) => a.ts - b.ts);
+  let wh = 0;
+  for (let i = 1; i < sorted.length; i += 1) {
+    const dtHours = Math.min(Math.max(sorted[i].ts - sorted[i - 1].ts, 0), 3600) / 3600;
+    wh += ((sorted[i].power + sorted[i - 1].power) / 2) * dtHours;
   }
-  if (store.telemetryRange === "24h") {
-    return Number((avgPower * 24 / 1000).toFixed(2));
-  }
-  if (store.telemetryRange === "7d") {
-    return Number((avgPower * 24 * 7 / 1000).toFixed(2));
-  }
-  return Number((avgPower * 24 * 30 / 1000).toFixed(2));
+  return Number((wh / 1000).toFixed(3));
 }
 
-function calcYesterdayDelta(todayKwh) {
-  const yesterday = todayKwh * 0.88;
-  if (!yesterday) return "0%";
-  const delta = ((todayKwh - yesterday) / yesterday) * 100;
-  return `${delta >= 0 ? "+" : ""}${delta.toFixed(0)}%`;
+function currentPowerW() {
+  return Number(store.deviceStatus?.total_power_w || 0);
 }
 
-function telemetryChart() {
+function telemetryChart({ compact = false } = {}) {
   const points = store.telemetry.slice(-240);
-  if (!points.length) return "<div class='small'>暂无遥测数据</div>";
+  if (!points.length) return "<div class='empty-state'>暂无遥测数据</div>";
 
   const values = points.map((p) => Number(p.power_w || 0));
   const valueMin = Math.min(...values);
@@ -565,32 +734,29 @@ function telemetryChart() {
   }
 
   const width = 320;
-  const height = 100;
+  const height = compact ? 76 : 100;
   const toX = (i) => (i / (points.length - 1 || 1)) * width;
   const toY = (v) => height - ((v - min) / (max - min || 1)) * height;
   const linePoints = points.map((p, i) => `${toX(i)},${toY(Number(p.power_w || 0))}`).join(" ");
   const areaPoints = `0,${height} ${linePoints} ${width},${height}`;
-  const thresholdY = toY(POWER_ALERT_THRESHOLD);
-  const showThreshold = POWER_ALERT_THRESHOLD >= min && POWER_ALERT_THRESHOLD <= max;
 
   return `
-    <div class="chart-wrap">
-      <svg viewBox="0 0 ${width} ${height}" width="100%" height="100" preserveAspectRatio="none">
+    <div class="chart-wrap ${compact ? "compact" : ""}">
+      <svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" preserveAspectRatio="none">
         <defs>
           <linearGradient id="powerFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.35"></stop>
-            <stop offset="100%" stop-color="#60a5fa" stop-opacity="0"></stop>
+            <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.35"></stop>
+            <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0"></stop>
           </linearGradient>
         </defs>
         <line x1="0" y1="${toY(min)}" x2="${width}" y2="${toY(min)}" stroke="#cbd5e1" stroke-width="1"></line>
         <line x1="0" y1="${toY((min + max) / 2)}" x2="${width}" y2="${toY((min + max) / 2)}" stroke="#e2e8f0" stroke-width="1"></line>
         <line x1="0" y1="${toY(max)}" x2="${width}" y2="${toY(max)}" stroke="#e2e8f0" stroke-width="1"></line>
-        ${showThreshold ? `<line x1="0" y1="${thresholdY}" x2="${width}" y2="${thresholdY}" stroke="#f79009" stroke-width="1.5" stroke-dasharray="4 3"></line>` : ""}
         <polygon points="${areaPoints}" fill="url(#powerFill)"></polygon>
-        <polyline fill="none" stroke="#1677ff" stroke-width="2" points="${linePoints}"></polyline>
+        <polyline fill="none" stroke="#0284c7" stroke-width="2.5" points="${linePoints}"></polyline>
       </svg>
       <div class="chart-legend">
-        <span><i class="legend-dot" style="background:#1677ff"></i>功率</span>
+        <span><i class="legend-dot" style="background:#0284c7"></i>功率</span>
         <span class="muted">Min ${valueMin.toFixed(1)}W</span>
         <span class="muted">Max ${valueMax.toFixed(1)}W</span>
       </div>
@@ -600,12 +766,9 @@ function telemetryChart() {
 
 function normalizeDeviceTypeName(input) {
   const raw = String(input || "").trim();
-  if (!raw) return "";
-  if (raw === "Unknown") return "";
-
+  if (!raw || raw === "Unknown") return "";
   const mapped = DEVICE_TYPE_OPTIONS.find((x) => x.value === raw || x.label === raw);
   if (mapped && mapped.value !== "Other") return mapped.value;
-
   const cleaned = raw
     .replace(/\s+/g, "_")
     .replace(/[^A-Za-z0-9_-]/g, "_")
@@ -618,7 +781,7 @@ function normalizeDeviceTypeName(input) {
 
 function readableDeviceType(device) {
   const name = String(device || "").trim();
-  if (!name || name === "Unknown" || name === "None") return "未识别";
+  if (!name || name === "Unknown" || name === "None") return "未识别设备";
   return DEVICE_TYPE_LABEL_MAP[name] ? `${DEVICE_TYPE_LABEL_MAP[name]} (${name})` : name;
 }
 
@@ -631,55 +794,360 @@ function typeSelectOptionsHtml(currentValue = "") {
   }).join("");
 }
 
-function socketCardHtml(socket) {
-  const targetKey = `${store.selectedDeviceId}:${socket.id}:switch`;
-  const pending = store.pendingCmdByTarget.has(targetKey);
-  const highPower = Number(socket.power_w || 0) >= POWER_ALERT_THRESHOLD;
-  const status = pending ? "执行中" : socket.on ? "开启" : "关闭";
+function pill(text, tone = "neutral") {
+  return `<span class="pill ${tone}">${escapeHtml(text)}</span>`;
+}
+
+function socketSummaryCard(socket) {
+  const b = socketBehavior(socket);
+  const meta = behaviorMeta(b.tag);
+  const tone = b.score > 0 ? levelMeta(b.level).tone : socket.on ? "ok" : "neutral";
+  return `
+    <button class="socket-mini ${tone}" data-go-socket="${socket.id}">
+      <span class="socket-mini-top">插孔 ${socket.id}</span>
+      <strong>${escapeHtml(readableDeviceType(socket.device))}</strong>
+      <span>${Number(socket.power_w || 0).toFixed(1)}W · ${escapeHtml(meta.title)}</span>
+    </button>
+  `;
+}
+
+function learnPanelHtml(socket, disabled) {
   const currentType = String(socket.device || "Unknown");
   const unknownType = !currentType || currentType === "Unknown" || currentType === "None";
   const pendingId = Number.isFinite(Number(socket.pendingId)) ? Number(socket.pendingId) : null;
-  const showLearnPanel = unknownType || pendingId !== null;
+  if (!unknownType && pendingId === null) return "";
   const normalizedCurrentType = normalizeDeviceTypeName(currentType);
   const customDraft = String(customTypeDraftBySocket.get(socket.id) || "");
-
   return `
-    <div class="socket-card ${socket.on ? "on" : "off"} ${pending ? "pending" : ""} ${highPower ? "high" : ""}">
-      <div class="socket-title"><strong>插孔 ${socket.id}</strong><span class="socket-state">${status}</span></div>
-      <div class="socket-power">${Number(socket.power_w || 0).toFixed(1)}<span>W</span></div>
-      <div class="small">设备：${readableDeviceType(currentType)}</div>
-      <div class="small">识别状态：${unknownType ? "未识别" : "已识别"}</div>
-      <div class="row socket-ops">
-        <button data-socket-correct="${socket.id}" class="btn socket-correct" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>重识别</button>
-      </div>
-      ${
-        showLearnPanel
-          ? `
-      <div class="learn-panel">
-        <div class="small">设备类型提交${pendingId !== null ? `（pendingId: ${pendingId}）` : ""}</div>
-        <select class="input socket-type-select" data-socket="${socket.id}">
-          ${typeSelectOptionsHtml(normalizedCurrentType)}
-        </select>
-        <input class="input socket-type-custom" data-socket="${socket.id}" value="${customDraft}" placeholder="自定义类型（如 Reading_Lamp）" />
-        <button data-socket-learn="${socket.id}" data-pending-id="${pendingId ?? ""}" class="btn primary socket-learn-submit" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>提交类型</button>
-      </div>
-      `
-          : ""
-      }
-      <button data-socket="${socket.id}" data-action="${socket.on ? "off" : "on"}" class="btn ${socket.on ? "danger" : "primary"} socket-toggle" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>
-        ${pending ? "执行中..." : socket.on ? "关闭" : "开启"}
-      </button>
+    <div class="learn-panel">
+      <div class="learn-title">帮助系统识别这个设备</div>
+      <p class="small">请选择实际接入的设备类型。提交后系统会在后续识别中减少误提醒。</p>
+      <select class="input socket-type-select" data-socket="${socket.id}">
+        ${typeSelectOptionsHtml(normalizedCurrentType)}
+      </select>
+      <input class="input socket-type-custom" data-socket="${socket.id}" value="${escapeHtml(customDraft)}" placeholder="自定义类型，如 Reading_Lamp" />
+      <button data-socket-learn="${socket.id}" data-pending-id="${pendingId ?? ""}" class="btn primary socket-learn-submit" ${disabled ? "disabled" : ""}>提交设备类型</button>
     </div>
   `;
 }
 
-function filterAlerts() {
-  const now = Date.now();
-  return store.alerts.filter((a) => {
-    if (alertFilter === "unresolved" && a.resolved) return false;
-    if (alertFilter === "today" && now - a.ts > 24 * 3600 * 1000) return false;
-    if (alertFilter === "week" && now - a.ts > 7 * 24 * 3600 * 1000) return false;
-    return true;
+function socketCardHtml(socket) {
+  const b = socketBehavior(socket);
+  const meta = behaviorMeta(b.tag);
+  const level = levelMeta(b.level);
+  const targetKey = `${store.selectedDeviceId}:${socket.id}:switch`;
+  const pending = store.pendingCmdByTarget.has(targetKey);
+  const protectedCutoff = b.tag === "protected_cutoff";
+  const reasons = reasonTexts(b.reasonMask, b.tag);
+  const disabled = pending || !isOnline() || globalBusy || protectedCutoff;
+  const canToggle = !protectedCutoff;
+  const actionText = socket.on ? "关闭插孔" : "开启插孔";
+
+  return `
+    <article class="socket-card ${socket.on ? "on" : "off"} ${pending ? "pending" : ""} ${level.tone}" data-socket-card="${socket.id}">
+      <div class="socket-title">
+        <strong>插孔 ${socket.id}</strong>
+        ${pending ? pill("执行中", "warn") : pill(socket.on ? "已开启" : "已关闭", socket.on ? "ok" : "neutral")}
+      </div>
+      <div class="socket-main">
+        <div>
+          <div class="socket-power">${Number(socket.power_w || 0).toFixed(1)}<span>W</span></div>
+          <div class="small">设备：${escapeHtml(readableDeviceType(socket.device))}</div>
+        </div>
+        <div class="socket-risk">
+          ${pill(meta.title, level.tone)}
+          ${b.score > 0 ? `<div class="risk-score">风险分 ${b.score}</div>` : ""}
+        </div>
+      </div>
+      <p class="socket-desc">${escapeHtml(meta.desc)}</p>
+      ${
+        reasons.length
+          ? `<ul class="reason-list">${reasons.slice(0, 4).map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`
+          : ""
+      }
+      <div class="socket-durations">
+        ${b.standbySeconds ? `<span>待机 ${formatDuration(b.standbySeconds)}</span>` : ""}
+        ${b.highPowerSeconds ? `<span>高负载 ${formatDuration(b.highPowerSeconds)}</span>` : ""}
+        ${b.unknownSeconds ? `<span>未识别 ${formatDuration(b.unknownSeconds)}</span>` : ""}
+        ${b.switchCount ? `<span>开关 ${b.switchCount} 次</span>` : ""}
+      </div>
+      ${protectedCutoff ? `<div class="notice danger">该插孔已进入保护断电。请先确认接入设备是否正常，必要时联系管理员处理。</div>` : ""}
+      ${learnPanelHtml(socket, pending || !isOnline() || globalBusy)}
+      <div class="socket-actions">
+        <button data-socket-correct="${socket.id}" class="btn" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>重新识别</button>
+        ${
+          canToggle
+            ? `<button data-socket="${socket.id}" data-action="${socket.on ? "off" : "on"}" class="btn ${socket.on ? "danger" : "primary"} socket-toggle" ${disabled ? "disabled" : ""}>${pending ? "执行中..." : actionText}</button>`
+            : `<button class="btn" disabled>保护中不可直接开启</button>`
+        }
+      </div>
+    </article>
+  `;
+}
+
+function deviceSelector() {
+  const d = selectedDevice();
+  return `
+    <section class="card compact-card bound-device-card">
+      <div class="row row-center row-between">
+        <div>
+          <div class="small">当前绑定设备</div>
+          <strong>${d ? `${escapeHtml(d.room || "-")} / ${escapeHtml(d.name || d.id)}` : "暂无绑定设备"}</strong>
+        </div>
+        <button id="refreshBtn" class="btn">刷新</button>
+      </div>
+    </section>
+  `;
+}
+
+function telemetryRangeSelector() {
+  return `
+    <div class="range-row">
+      ${ALLOWED_RANGES.map((r) => `<button data-range="${r}" class="btn range-btn ${store.telemetryRange === r ? "primary" : ""}">${RANGE_LABELS[r]}</button>`).join("")}
+    </div>
+  `;
+}
+
+function renderStatusHero() {
+  const d = selectedDevice();
+  const b = rootBehavior();
+  const tone = riskTone();
+  const todayKwh = calcUsageKwhFromTelemetry();
+  return `
+    <section class="card hero-card ${tone}">
+      <div class="hero-top">
+        <div>
+          <div class="hero-title">${escapeHtml(d?.name || d?.id || "智能插排")}</div>
+          <h2>${escapeHtml(statusTitle())}</h2>
+        </div>
+        ${pill(isOnline() ? "在线" : "离线", isOnline() ? "ok" : "neutral")}
+      </div>
+      <p>${escapeHtml(statusSubtitle())}</p>
+      <div class="hero-metrics">
+        <div><span>当前功率</span><strong>${currentPowerW().toFixed(1)}W</strong></div>
+        <div><span>区间电量</span><strong>${todayKwh}kWh</strong></div>
+        <div><span>风险分</span><strong>${b.risk}</strong></div>
+      </div>
+    </section>
+  `;
+}
+
+function renderDailyCheckup() {
+  const check = store.dailyCheckup;
+  if (!check) {
+    return `
+      <section class="card">
+        <div class="section-head">
+          <h3>今日用电体检</h3>
+          ${pill("待加载", "neutral")}
+        </div>
+        <div class="empty-state">暂未获取到体检结果，稍后刷新或检查后端接口。</div>
+      </section>
+    `;
+  }
+  const severity = levelMeta(check.severity || "low");
+  const standbyHours = (check.standbyWaste || []).reduce((sum, item) => sum + Number(item.standbyHours || 0), 0);
+  const alertCount = (check.events || []).length;
+  const focus = check.highestRiskSocket;
+  const suggestions = check.suggestions || [];
+  return `
+    <section class="card">
+      <div class="section-head">
+        <h3>今日用电体检</h3>
+        ${pill(severity.title, severity.tone)}
+      </div>
+      <p>${escapeHtml(check.summary || "暂无明显异常。")}</p>
+      <div class="kpi-row">
+        <div class="kpi"><span>最高功率</span><strong>${Number(check.peakPowerW || 0).toFixed(1)}W</strong></div>
+        <div class="kpi"><span>待机累计</span><strong>${standbyHours.toFixed(1)}h</strong></div>
+        <div class="kpi"><span>提醒次数</span><strong>${alertCount}</strong></div>
+      </div>
+      ${
+        focus
+          ? `<div class="notice ${severity.tone}">重点关注：插孔 ${focus.socketId || focus.socket || "-"}，${escapeHtml(focus.title || focus.reason || "存在风险")}</div>`
+          : ""
+      }
+      ${
+        suggestions.length
+          ? `<ul class="suggestion-list">${suggestions.slice(0, 2).map((s) => `<li>${escapeHtml(s.title || s.reason || s)}</li>`).join("")}</ul>`
+          : ""
+      }
+    </section>
+  `;
+}
+
+function renderSocketOverview() {
+  const sockets = store.deviceStatus?.sockets || [];
+  return `
+    <section class="card">
+      <div class="section-head">
+        <h3>当前插孔摘要</h3>
+        <button class="link-btn" data-go-tab="device">查看全部</button>
+      </div>
+      <div class="socket-mini-grid">
+        ${sockets.map(socketSummaryCard).join("") || "<div class='empty-state'>暂无插孔数据</div>"}
+      </div>
+    </section>
+  `;
+}
+
+function renderRecentReminders(limit = 3) {
+  const items = mergedReminderItems().slice(0, limit);
+  return `
+    <section class="card">
+      <div class="section-head">
+        <h3>最近提醒</h3>
+        <button class="link-btn" data-go-tab="alerts">全部提醒</button>
+      </div>
+      <div class="alert-list">
+        ${items.map(reminderCardHtml).join("") || "<div class='empty-state'>暂无提醒</div>"}
+      </div>
+    </section>
+  `;
+}
+
+function renderQuickActions() {
+  return `
+    <section class="card">
+      <h3>快捷操作</h3>
+      <div class="quick-grid">
+        <button id="quickAllOff" class="btn danger" ${!isOnline() || globalBusy ? "disabled" : ""}>全部关闭</button>
+        <button id="quickSleep" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>睡眠模式</button>
+        <button id="quickEco" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>一键节能</button>
+        <button id="quickCutoff" class="btn danger ghost" ${!isOnline() || globalBusy ? "disabled" : ""}>紧急断电</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderAssistantCard() {
+  return `
+    <section class="card assistant-card">
+      <div class="section-head">
+        <h3>轻量助手</h3>
+        ${store.assistantBusy ? pill("思考中", "warn") : pill("固定问题优先", "neutral")}
+      </div>
+      <div class="assistant-questions">
+        ${ASSISTANT_QUESTIONS.map((q) => `<button class="btn assistant-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join("")}
+      </div>
+      ${store.assistantReply ? `<div class="assistant-reply">${escapeHtml(store.assistantReply)}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderHome() {
+  return `
+    ${deviceSelector()}
+    ${renderStatusHero()}
+    ${renderDailyCheckup()}
+    ${renderSocketOverview()}
+    <section class="card">
+      <div class="section-head">
+        <h3>功率趋势</h3>
+        <span class="small">${RANGE_LABELS[store.telemetryRange] || store.telemetryRange}</span>
+      </div>
+      ${telemetryRangeSelector()}
+      ${telemetryChart({ compact: true })}
+    </section>
+    ${renderRecentReminders(3)}
+    ${renderQuickActions()}
+    ${renderAssistantCard()}
+  `;
+}
+
+function renderDevice() {
+  return `
+    ${deviceSelector()}
+    <section class="card">
+      <h3>安全控制</h3>
+      <p class="small">普通操作可直接控制单个插孔；批量和高风险操作会要求确认。保护断电状态不会直接提供恢复供电按钮。</p>
+      <div class="quick-grid">
+        <button id="allOff" class="btn danger" ${!isOnline() || globalBusy ? "disabled" : ""}>全部关闭</button>
+        <button id="allOn" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>全部开启</button>
+        <button id="quickSleep" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>睡眠模式</button>
+        <button id="quickEco" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>一键节能</button>
+      </div>
+    </section>
+    <section class="card">
+      <div class="section-head">
+        <h3>插孔状态</h3>
+        ${pill(`${(store.deviceStatus?.sockets || []).length} 路`, "neutral")}
+      </div>
+      <div class="socket-grid">
+        ${(store.deviceStatus?.sockets || []).map((s) => socketCardHtml(s)).join("") || "<div class='empty-state'>暂无插孔数据</div>"}
+      </div>
+    </section>
+  `;
+}
+
+function reminderCategory(item) {
+  if (item.kind === "local") {
+    if (item.type === "OFFLINE") return "device";
+    if (item.type === "CONTROL_FAIL") return "control";
+    return "control";
+  }
+  if (item.tag === "protected_cutoff" || item.tag === "unknown_high_power") return "action";
+  if (item.tag === "standby_waste" || item.tag === "long_high_power" || item.tag === "frequent_switching") return "usage";
+  return "device";
+}
+
+function mergedReminderItems() {
+  const behavior = (store.behaviorEvents || []).map((e) => ({
+    kind: "behavior",
+    id: `b-${e.id}`,
+    ts: Number(e.receivedAt || 0) * 1000,
+    ...e,
+  }));
+  const local = store.alerts.map((a) => ({ ...a, kind: "local" }));
+  return [...behavior, ...local].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+}
+
+function reminderCardHtml(item) {
+  if (item.kind === "local") {
+    const tone = item.level === "err" ? "danger" : "warn";
+    return `
+      <article class="alert-item ${tone}">
+        <div class="alert-title">${escapeHtml(humanizeAlert(item))}</div>
+        <div class="small">${formatTime(item.ts)}</div>
+        <div class="alert-actions">
+          <button data-alert-id="${item.id}" class="btn retry-alert">重试</button>
+          <button data-alert-id="${item.id}" class="btn resolve-alert">${item.resolved ? "已忽略" : "忽略"}</button>
+        </div>
+      </article>
+    `;
+  }
+
+  const meta = behaviorMeta(item.tag);
+  const level = levelMeta(item.level);
+  const reasons = reasonTexts(item.reasonMask, item.tag);
+  return `
+    <article class="alert-item ${level.tone}">
+      <div class="alert-head">
+        <div>
+          <div class="alert-title">${escapeHtml(meta.title)}</div>
+          <div class="small">插孔 ${item.socketId || "-"} · ${formatTime(item.ts)}</div>
+        </div>
+        ${pill(level.title, level.tone)}
+      </div>
+      <p>${escapeHtml(meta.desc)}</p>
+      <div class="small">设备：${escapeHtml(readableDeviceType(item.deviceName))} · 功率 ${Number(item.powerW || 0).toFixed(1)}W · 风险分 ${item.score}</div>
+      ${reasons.length ? `<ul class="reason-list">${reasons.slice(0, 3).map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>` : ""}
+      <div class="alert-actions">
+        <button class="btn" data-go-socket="${item.socketId || ""}">查看插孔</button>
+        ${item.tag === "unknown_high_power" ? `<button class="btn primary" data-go-socket="${item.socketId || ""}">标注设备</button>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function filterReminders() {
+  return mergedReminderItems().filter((item) => {
+    if (item.kind === "local" && item.type === "OFFLINE" && !prefEnabled("offline")) return false;
+    if (item.kind === "local" && item.type === "CONTROL_FAIL" && !prefEnabled("control")) return false;
+    if (item.kind === "behavior" && item.tag === "standby_waste" && !prefEnabled("standby")) return false;
+    if (item.kind === "behavior" && item.tag === "unknown_high_power" && !prefEnabled("unknown")) return false;
+    if (alertFilter === "all") return true;
+    return reminderCategory(item) === alertFilter;
   });
 }
 
@@ -703,155 +1171,53 @@ function humanizeAlert(alert) {
   if (alert.type === "OFFLINE") return "设备离线，请检查电源或网络。";
   if (alert.type === "CONTROL_FAIL") return "控制失败，请重试。";
   if (alert.type === "SYSTEM") return "系统异常，请稍后重试。";
-  return alert.detail || "告警";
-}
-
-function deviceSelector() {
-  if (store.user?.role === "student") {
-    const d = selectedDevice();
-    return `
-      <section class="card">
-        <div class="row row-center">
-          <div class="small">${d ? `${d.room || "-"} / ${d.name || d.id}` : "暂无设备"}</div>
-          <button id="refreshBtn" class="btn">刷新</button>
-        </div>
-      </section>
-    `;
-  }
-
-  return `
-    <section class="card">
-      <div class="row row-center">
-        <select id="deviceSelect" class="input">
-          ${store.devices
-      .map((d) => `<option value="${d.id}" ${d.id === store.selectedDeviceId ? "selected" : ""}>${d.room || "-"} / ${d.name || d.id}</option>`)
-      .join("")}
-        </select>
-        <button id="refreshBtn" class="btn">刷新</button>
-      </div>
-    </section>
-  `;
-}
-
-function telemetryRangeSelector() {
-  return `
-    <div class="row row-center">
-      <label class="small" for="telemetryRange">时间范围</label>
-      <select id="telemetryRange" class="input">
-        ${ALLOWED_RANGES.map((r) => `<option value="${r}" ${store.telemetryRange === r ? "selected" : ""}>${RANGE_LABELS[r]}</option>`).join("")}
-      </select>
-    </div>
-  `;
-}
-
-function renderHome() {
-  const d = selectedDevice();
-  const currentPower = Number(store.deviceStatus?.total_power_w || 0).toFixed(1);
-  const usageKwh = calcTodayUsageKwh();
-  const yesterdayDelta = calcYesterdayDelta(usageKwh);
-  const nightRate = `${Math.min(80, Math.max(10, Math.round((usageKwh * 13) % 50 + 20)))}%`;
-  const peakTime = `${19 + (usageKwh > 1 ? 1 : 0)}:00`;
-
-  return `
-    ${deviceSelector()}
-    <section class="card hero-card">
-      <div class="hero-title">区间用电</div>
-      <div class="hero-value">${usageKwh}<span>kWh</span></div>
-      <div class="small">较参考值 ${yesterdayDelta} | 夜间占比 ${nightRate} | 峰值时段 ${peakTime}</div>
-    </section>
-    <section class="card">
-      <div class="row">
-        <div class="kpi"><div class="label">当前功率</div><div class="value">${currentPower}<span class="unit">W</span></div></div>
-        <div class="kpi"><div class="label">未处理告警</div><div class="value">${store.alerts.filter((a) => !a.resolved).length}</div></div>
-      </div>
-      <div class="small">状态：${isOnline() ? "在线" : "离线"} | 设备：${d ? `${d.room || "-"} / ${d.name || d.id}` : "请选择"}</div>
-    </section>
-    <section class="card">
-      <div class="row">
-        <button id="quickCutoff" class="btn danger" ${!isOnline() || globalBusy ? "disabled" : ""}>一键断电</button>
-        <button id="quickSleep" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>睡眠模式</button>
-        <button id="quickEco" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>节能模式</button>
-      </div>
-    </section>
-    <section class="card">
-      <h3>功率曲线（${RANGE_LABELS[store.telemetryRange] || store.telemetryRange}）</h3>
-      ${telemetryRangeSelector()}
-      ${telemetryChart()}
-    </section>
-    <section class="card">
-      <h3>最近事件</h3>
-      <div class="event-list">
-        ${store.events
-      .slice(0, 8)
-      .map((e) => `<div class="event-item"><strong>${eventTypeLabel(e.type)}</strong> ${e.detail}<div class="small">${formatTime(e.ts)}</div></div>`)
-      .join("") || "<div class='small'>暂无事件</div>"
-    }
-      </div>
-    </section>
-  `;
-}
-
-function renderDevice() {
-  return `
-    ${deviceSelector()}
-    <section class="card">
-      <div class="row">
-        <button id="allOn" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>全部开启</button>
-        <button id="allOff" class="btn danger" ${!isOnline() || globalBusy ? "disabled" : ""}>全部关闭</button>
-      </div>
-      <p class="small">批量操作会逐个插孔下发命令并显示进度。</p>
-    </section>
-    <section class="card">
-      <h3>插孔矩阵</h3>
-      <div class="socket-grid">
-        ${(store.deviceStatus?.sockets || []).map((s) => socketCardHtml(s)).join("") || "<div class='small'>暂无插孔数据</div>"}
-      </div>
-    </section>
-  `;
+  return alert.detail || "提醒";
 }
 
 function renderAlerts() {
-  const list = filterAlerts();
+  const list = filterReminders();
+  const filters = [
+    ["all", "全部"],
+    ["action", "需要处理"],
+    ["usage", "用电提醒"],
+    ["device", "设备异常"],
+    ["control", "控制记录"],
+  ];
   return `
     ${deviceSelector()}
     <section class="card">
-      <div class="row">
-        <button data-filter="all" class="btn filter-btn ${alertFilter === "all" ? "primary" : ""}">全部</button>
-        <button data-filter="unresolved" class="btn filter-btn ${alertFilter === "unresolved" ? "primary" : ""}">未处理</button>
-        <button data-filter="today" class="btn filter-btn ${alertFilter === "today" ? "primary" : ""}">今日</button>
-        <button data-filter="week" class="btn filter-btn ${alertFilter === "week" ? "primary" : ""}">本周</button>
+      <h3>提醒中心</h3>
+      <div class="filter-row">
+        ${filters.map(([key, label]) => `<button data-filter="${key}" class="btn filter-btn ${alertFilter === key ? "primary" : ""}">${label}</button>`).join("")}
       </div>
-      <div class="row">
-        <button id="clearAlertsBtn" class="btn">清空</button>
-      </div>
-      <h3>告警列表</h3>
       <div class="alert-list">
-        ${list
-      .slice(0, 30)
-      .map(
-        (a) => `
-            <div class="alert-item ${a.level === "err" ? "err" : "warn"}">
-              <strong>${humanizeAlert(a)}</strong>
-              <div class="small">${formatTime(a.ts)}</div>
-              <div class="row">
-                <button data-alert-id="${a.id}" class="btn retry-alert">重试</button>
-                <button data-alert-id="${a.id}" class="btn resolve-alert">${a.resolved ? "已忽略" : "忽略"}</button>
-              </div>
-            </div>
-          `,
-      )
-      .join("") || "<div class='small'>暂无告警</div>"
-    }
+        ${list.slice(0, 50).map(reminderCardHtml).join("") || "<div class='empty-state'>暂无提醒</div>"}
+      </div>
+      <div class="row">
+        <button id="clearAlertsBtn" class="btn">清空本地提醒</button>
       </div>
     </section>
+    ${renderAssistantCard()}
+  `;
+}
+
+function prefEnabled(key) {
+  return store.alertPrefs[key] !== false;
+}
+
+function renderPrefToggle(key, label, desc) {
+  return `
+    <label class="pref-row">
+      <span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(desc)}</small></span>
+      <input type="checkbox" class="pref-toggle" data-pref="${escapeHtml(key)}" ${prefEnabled(key) ? "checked" : ""} />
+    </label>
   `;
 }
 
 function renderMe() {
   const d = selectedDevice();
-  const usageKwh = calcTodayUsageKwh();
-  const weeklyKwh = Number((usageKwh * 7).toFixed(1));
-  const nightRate = `${Math.min(80, Math.max(10, Math.round((usageKwh * 13) % 50 + 20)))}%`;
+  const usageKwh = calcUsageKwhFromTelemetry();
+  const weeklyKwh = Number((usageKwh * 7).toFixed(2));
   const mailStatus = !mailPreference.loaded
     ? "加载中..."
     : !mailPreference.smtpConfigured
@@ -863,41 +1229,49 @@ function renderMe() {
           : "邮件提醒已关闭";
 
   return `
-    <section class="card">
-      <h3>账户信息</h3>
-      <p class="small">用户名：${store.user?.username || "-"}</p>
-      <p class="small">角色：${store.user?.role || "-"}</p>
-    </section>
-    <section class="card">
-      <h3>宿舍绑定</h3>
-      <p class="small">${d ? `${d.room || "-"} / ${d.name || d.id}` : "未绑定"}</p>
-    </section>
-    <section class="card">
-      <h3>用电统计</h3>
-      <p class="small">近一周估算用电：${weeklyKwh} kWh</p>
-      <p class="small">夜间占比：${nightRate}</p>
+    <section class="card profile-card">
+      <h3>账户与设备</h3>
+      <p>用户名：${escapeHtml(store.user?.username || "-")}</p>
+      <p class="small">角色：${escapeHtml(store.user?.role || "-")}</p>
+      <p class="small">绑定设备：${d ? `${escapeHtml(d.room || "-")} / ${escapeHtml(d.name || d.id)}` : "未绑定"}</p>
     </section>
     <section class="card">
       <h3>通知设置</h3>
-      <p class="small">接收邮箱：${mailPreference.email || store.user?.email || "-"}</p>
-      <p class="small">状态：${mailStatus}</p>
-      <div class="row">
-        <button id="toggleMailBtn" class="btn ${mailPreference.enabled ? "" : "primary"}" ${!mailPreference.loaded || !mailPreference.smtpConfigured ? "disabled" : ""}>
-          ${mailPreference.enabled ? "关闭邮件提醒" : "开启邮件提醒"}
-        </button>
-      </div>
+      <p class="small">接收邮箱：${escapeHtml(mailPreference.email || store.user?.email || "-")}</p>
+      <p class="small">状态：${escapeHtml(mailStatus)}</p>
+      <button id="toggleMailBtn" class="btn ${mailPreference.enabled ? "" : "primary"}" ${!mailPreference.loaded || !mailPreference.smtpConfigured ? "disabled" : ""}>
+        ${mailPreference.enabled ? "关闭邮件提醒" : "开启邮件提醒"}
+      </button>
+    </section>
+    <section class="card">
+      <h3>提醒偏好</h3>
+      ${renderPrefToggle("standby", "待机提醒", "设备长时间低功率运行时提醒我")}
+      ${renderPrefToggle("unknown", "Unknown 设备提醒", "设备未识别且功率较高时提醒我")}
+      ${renderPrefToggle("offline", "设备离线提醒", "插排离线时提醒我")}
+      ${renderPrefToggle("control", "控制结果提醒", "控制失败或超时时提醒我")}
+    </section>
+    <section class="card">
+      <h3>用电概览</h3>
+      <p class="small">当前区间估算用电：${usageKwh} kWh</p>
+      <p class="small">近一周粗略估算：${weeklyKwh} kWh</p>
+      <p class="small">最近行为事件：${(store.behaviorEvents || []).length} 条</p>
+    </section>
+    <section class="card">
+      <h3>帮助中心</h3>
+      <details><summary>为什么显示 Unknown？</summary><p class="small">表示系统暂时无法确认接入设备类型。请确认设备是否正常，并在插孔页提交设备类型帮助系统学习。</p></details>
+      <details><summary>为什么被保护断电？</summary><p class="small">protected_cutoff 表示端侧已经执行保护动作。请先检查现场设备，不建议直接恢复供电。</p></details>
+      <details><summary>设备离线怎么办？</summary><p class="small">先检查插排电源和网络。离线时 0W 不代表设备已关闭，控制命令也无法可靠执行。</p></details>
+      <details><summary>怎么减少待机耗电？</summary><p class="small">优先关闭长时间低功率待机的充电器、灯具和外设，睡前可使用睡眠模式或一键节能。</p></details>
     </section>
     ${store.debugMode
       ? `
       <section class="card">
         <h3>调试连接</h3>
         <label class="small" for="apiBaseInput">API 地址</label>
-        <input id="apiBaseInput" class="input" value="${getApiBase()}" />
+        <input id="apiBaseInput" class="input" value="${escapeHtml(getApiBase())}" />
         <label class="small" for="wsBaseInput">WS 地址</label>
-        <input id="wsBaseInput" class="input" value="${getWsBase()}" />
-        <div class="row">
-          <button id="saveConnBtn" class="btn primary">保存并重连</button>
-        </div>
+        <input id="wsBaseInput" class="input" value="${escapeHtml(getWsBase())}" />
+        <button id="saveConnBtn" class="btn primary">保存并重连</button>
       </section>
     `
       : ""
@@ -918,22 +1292,12 @@ function renderLogin() {
       <input id="account" class="input" value="admin" />
       <label class="small" for="password">密码</label>
       <input id="password" class="input" type="password" value="admin123" />
-      <div class="row">
-        <button id="loginBtn" class="btn primary">登录</button>
-      </div>
+      <button id="loginBtn" class="btn primary">登录</button>
     </section>
   `;
 }
 
 function bindDeviceSelectorAndRefresh() {
-  const select = document.getElementById("deviceSelect");
-  if (select) {
-    select.addEventListener("change", async () => {
-      setSelectedDeviceId(select.value);
-      await bootstrapData();
-    });
-  }
-
   const refreshBtn = document.getElementById("refreshBtn");
   if (refreshBtn) refreshBtn.onclick = () => bootstrapData();
 }
@@ -942,7 +1306,6 @@ function bindLogin() {
   const loginBtn = document.getElementById("loginBtn");
   const passwordInput = document.getElementById("password");
   if (!loginBtn) return;
-
   const submit = async () => {
     const account = document.getElementById("account").value.trim();
     const password = document.getElementById("password").value.trim();
@@ -961,7 +1324,6 @@ function bindLogin() {
       render();
     }
   };
-
   loginBtn.addEventListener("click", submit);
   if (passwordInput) {
     passwordInput.addEventListener("keydown", (evt) => {
@@ -973,47 +1335,78 @@ function bindLogin() {
 function bindActions() {
   bindDeviceSelectorAndRefresh();
 
-  const telemetryRangeSelect = document.getElementById("telemetryRange");
-  if (telemetryRangeSelect) {
-    telemetryRangeSelect.addEventListener("change", async () => {
-      const nextRange = telemetryRangeSelect.value;
+  document.querySelectorAll(".range-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const nextRange = btn.dataset.range;
       if (!ALLOWED_RANGES.includes(nextRange)) return;
       setTelemetryRange(nextRange);
       lastTelemetryRefreshAt = 0;
       await refreshTelemetryIfNeeded(true);
       render();
     });
-  }
+  });
+
+  document.querySelectorAll("[data-go-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      currentTab = btn.dataset.goTab;
+      tabs.forEach((b) => b.classList.toggle("active", b.dataset.tab === currentTab));
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-go-socket]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      currentTab = "device";
+      tabs.forEach((b) => b.classList.toggle("active", b.dataset.tab === currentTab));
+      render();
+      setTimeout(() => {
+        const socketId = btn.dataset.goSocket;
+        document.querySelector(`[data-socket-card="${socketId}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 0);
+    });
+  });
+
+  const quickAllOff = document.getElementById("quickAllOff");
+  if (quickAllOff) quickAllOff.onclick = () => executeBulkSocketAction("off", { label: "确认关闭全部已开启插孔？" });
 
   const quickCutoff = document.getElementById("quickCutoff");
-  if (quickCutoff) quickCutoff.onclick = () => executeBulkSocketAction("off");
+  if (quickCutoff) quickCutoff.onclick = () => executeBulkSocketAction("off", { label: "紧急断电会关闭全部已开启插孔，确认继续？", strong: true });
 
   const quickSleep = document.getElementById("quickSleep");
   if (quickSleep) {
     quickSleep.onclick = async () => {
+      if (!window.confirm("确认下发睡眠模式？系统会按端侧策略关闭非必要插孔。")) return;
       await executeCmd({ action: "mode", mode: "sleep" }, `${store.selectedDeviceId}:mode:sleep`);
-      showToast("已提交睡眠模式");
+      await bootstrapData();
     };
   }
 
   const quickEco = document.getElementById("quickEco");
   if (quickEco) {
     quickEco.onclick = async () => {
+      if (!window.confirm("确认下发一键节能？系统会优先处理待机浪费插孔。")) return;
       await executeCmd({ action: "mode", mode: "eco" }, `${store.selectedDeviceId}:mode:eco`);
-      showToast("已提交节能模式");
+      await bootstrapData();
     };
   }
 
   const allOn = document.getElementById("allOn");
-  if (allOn) allOn.onclick = () => executeBulkSocketAction("on");
+  if (allOn) allOn.onclick = () => executeBulkSocketAction("on", { label: "全部开启属于中风险操作，确认继续？", strong: true });
 
   const allOff = document.getElementById("allOff");
-  if (allOff) allOff.onclick = () => executeBulkSocketAction("off");
+  if (allOff) allOff.onclick = () => executeBulkSocketAction("off", { label: "确认关闭全部已开启插孔？" });
 
   document.querySelectorAll(".socket-toggle").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const socketId = Number(btn.dataset.socket);
       const action = btn.dataset.action;
+      const socket = (store.deviceStatus?.sockets || []).find((s) => Number(s.id) === socketId);
+      const b = socketBehavior(socket);
+      if (action === "on" && b.tag === "protected_cutoff") {
+        showToast("保护断电状态不可直接开启");
+        return;
+      }
+      if (b.level === "high" && !window.confirm(`插孔 ${socketId} 当前为高风险状态，确认${action === "off" ? "关闭" : "开启"}？`)) return;
       const key = `${store.selectedDeviceId}:${socketId}:switch`;
       await executeCmd({ socket: socketId, action }, key);
       await bootstrapData();
@@ -1027,10 +1420,9 @@ function bindActions() {
       const key = `${store.selectedDeviceId}:${socketId}:correct`;
       const result = await executeCmd({ socket: socketId, action: "correct" }, key);
       if (result.state === "success") {
-        addEvent("CORRECT", `插孔${socketId} 已下发重识别`);
-        showToast(`插孔${socketId} 已下发重识别`);
+        addEvent("CORRECT", `插孔${socketId} 已下发重新识别`);
       } else {
-        addAlert("CONTROL_FAIL", `插孔${socketId} 重识别失败`, "warn");
+        addAlert("CONTROL_FAIL", `插孔${socketId} 重新识别失败`, "warn");
       }
       await bootstrapData();
     });
@@ -1048,28 +1440,24 @@ function bindActions() {
     btn.addEventListener("click", async () => {
       const socketId = Number(btn.dataset.socketLearn);
       if (!Number.isFinite(socketId)) return;
-
       const select = document.querySelector(`.socket-type-select[data-socket="${socketId}"]`);
       const customInput = document.querySelector(`.socket-type-custom[data-socket="${socketId}"]`);
       const pick = select ? String(select.value || "").trim() : "";
       const custom = customInput ? String(customInput.value || "").trim() : "";
-
       const typeName = pick === "Other" ? normalizeDeviceTypeName(custom) : normalizeDeviceTypeName(pick || custom);
       if (!typeName) {
         showToast("请先选择或输入设备类型");
         return;
       }
-
       const rawPendingId = btn.dataset.pendingId;
       const pendingId = Number.isFinite(Number(rawPendingId)) ? Number(rawPendingId) : null;
       const payload = pendingId !== null ? { pendingId, name: typeName } : { name: typeName };
       const key = `${store.selectedDeviceId}:${socketId}:learn_commit`;
-
       const result = await executeCmd({ socket: socketId, action: "learn_commit", payload }, key);
       if (result.state === "success") {
         customTypeDraftBySocket.delete(socketId);
         addEvent("LEARN", `插孔${socketId} 类型已提交: ${typeName}`);
-        showToast(`插孔${socketId} 已提交类型`);
+        showToast("已提交，后续会减少误提醒");
       } else {
         addAlert("CONTROL_FAIL", `插孔${socketId} 提交类型失败`, "warn");
       }
@@ -1089,7 +1477,7 @@ function bindActions() {
   if (clearAlertsBtn) {
     clearAlertsBtn.onclick = () => {
       store.alerts = [];
-      showToast("告警已清空");
+      showToast("本地提醒已清空");
       render();
     };
   }
@@ -1110,14 +1498,43 @@ function bindActions() {
     });
   });
 
+  document.querySelectorAll(".pref-toggle").forEach((input) => {
+    input.addEventListener("change", () => {
+      setAlertPref(input.dataset.pref, input.checked);
+      showToast("提醒偏好已保存");
+    });
+  });
+
+  document.querySelectorAll(".assistant-question").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const question = btn.dataset.question || btn.textContent || "";
+      store.assistantBusy = true;
+      store.assistantReply = "";
+      render();
+      try {
+        const result = await postAgentQuery({
+          message: question,
+          roomId: selectedRoomId(),
+          deviceId: store.selectedDeviceId,
+          page: `pwa:${currentTab}`,
+          period: "7d",
+        }, store.token);
+        store.assistantReply = result?.reply || "暂时没有可用回答。";
+      } catch (err) {
+        if (handleAuthExpired(err)) return;
+        store.assistantReply = `助手暂时不可用：${err.message}`;
+      } finally {
+        store.assistantBusy = false;
+        render();
+      }
+    });
+  });
+
   const saveConnBtn = document.getElementById("saveConnBtn");
   if (saveConnBtn) {
     saveConnBtn.onclick = async () => {
-      const apiInput = document.getElementById("apiBaseInput");
-      const wsInput = document.getElementById("wsBaseInput");
-      const apiVal = apiInput?.value.trim() || "";
-      const wsVal = wsInput?.value.trim() || "";
-
+      const apiVal = document.getElementById("apiBaseInput")?.value.trim() || "";
+      const wsVal = document.getElementById("wsBaseInput")?.value.trim() || "";
       if (!/^https?:\/\//i.test(apiVal)) {
         showToast("API 地址格式错误");
         return;
@@ -1126,7 +1543,6 @@ function bindActions() {
         showToast("WS 地址格式错误");
         return;
       }
-
       setApiBase(apiVal);
       setWsBase(wsVal);
       addEvent("CONFIG", `连接地址已更新：${apiVal} / ${wsVal}`);
@@ -1201,7 +1617,6 @@ function render() {
 
 function startStatusPolling() {
   if (statusPollTimer) return;
-
   statusPollTimer = setInterval(async () => {
     if (!store.token || !store.selectedDeviceId || statusPolling) return;
     if (document.hidden || !navigator.onLine) return;
@@ -1209,6 +1624,7 @@ function startStatusPolling() {
     try {
       store.deviceStatus = await getDeviceStatus(store.selectedDeviceId, store.token);
       await refreshTelemetryIfNeeded(false);
+      await refreshSupplementIfNeeded(false);
       updateBadge();
       render();
     } catch (err) {
@@ -1259,10 +1675,8 @@ init().catch((err) => {
   app.innerHTML = `
     <section class="card">
       <h3>页面加载失败</h3>
-      <p class="small">原因：${err?.message || "未知错误"}</p>
-      <div class="row">
-        <button id="resetAppBtn" class="btn danger">清除缓存并重试</button>
-      </div>
+      <p class="small">原因：${escapeHtml(err?.message || "未知错误")}</p>
+      <button id="resetAppBtn" class="btn danger">清除缓存并重试</button>
     </section>
   `;
   const resetBtn = document.getElementById("resetAppBtn");
@@ -1287,6 +1701,6 @@ init().catch((err) => {
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("./sw.js?v=20260310").catch(() => null);
+    navigator.serviceWorker.register("./sw.js?v=20260630").catch(() => null);
   });
 }
