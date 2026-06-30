@@ -1,3 +1,15 @@
+function readJson(storageKey, fallback) {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed ?? fallback;
+  } catch {
+    localStorage.removeItem(storageKey);
+    return fallback;
+  }
+}
+
 export const store = {
   token: localStorage.getItem("dp_token") || "",
   user: null,
@@ -8,9 +20,10 @@ export const store = {
   telemetry: [],
   dailyCheckup: null,
   behaviorEvents: [],
-  assistantReply: "",
+  assistantMessages: readJson("dp_pwa_assistant_messages", []),
   assistantBusy: false,
-  alertPrefs: JSON.parse(localStorage.getItem("dp_alert_prefs") || "{}"),
+  alertPrefs: readJson("dp_alert_prefs", {}),
+  quickActionStates: readJson("dp_quick_action_states", {}),
   wsConnected: false,
   wsClient: null,
   events: [],
@@ -73,4 +86,44 @@ export function setTelemetryRange(range) {
 export function setAlertPref(key, enabled) {
   store.alertPrefs = { ...store.alertPrefs, [key]: Boolean(enabled) };
   localStorage.setItem("dp_alert_prefs", JSON.stringify(store.alertPrefs));
+}
+
+export function addAssistantMessage(role, content) {
+  const text = String(content || "").trim();
+  if (!text) return;
+  store.assistantMessages = [
+    ...store.assistantMessages,
+    {
+      id: `${Date.now()}_${Math.random().toString(16).slice(2, 7)}`,
+      role,
+      content: text,
+      ts: Date.now(),
+    },
+  ].slice(-30);
+  localStorage.setItem("dp_pwa_assistant_messages", JSON.stringify(store.assistantMessages));
+}
+
+export function clearAssistantMessages() {
+  store.assistantMessages = [];
+  localStorage.removeItem("dp_pwa_assistant_messages");
+}
+
+export function setQuickActionState(actionKey, state) {
+  store.quickActionStates = {
+    ...store.quickActionStates,
+    [actionKey]: {
+      state,
+      ts: Date.now(),
+    },
+  };
+  localStorage.setItem("dp_quick_action_states", JSON.stringify(store.quickActionStates));
+}
+
+export function clearQuickActionStates(actionKeys = []) {
+  const next = { ...store.quickActionStates };
+  actionKeys.forEach((key) => {
+    delete next[key];
+  });
+  store.quickActionStates = next;
+  localStorage.setItem("dp_quick_action_states", JSON.stringify(store.quickActionStates));
 }

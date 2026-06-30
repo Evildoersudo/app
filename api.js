@@ -100,7 +100,7 @@ export async function getBehaviorEvents({ deviceId = "", roomId = "", limit = 50
   return apiFetch(`/api/behavior-events?${params.toString()}`, { token });
 }
 
-export async function postAgentQuery({ message, roomId = "", deviceId = "", page = "pwa", period = "7d" }, token) {
+export async function postAgentQuery({ message, roomId = "", deviceId = "", page = "pwa", period = "7d", recentMessages = [] }, token) {
   return apiFetch("/api/agent/query", {
     method: "POST",
     body: {
@@ -112,6 +112,7 @@ export async function postAgentQuery({ message, roomId = "", deviceId = "", page
         roomId,
         deviceId,
         timeRange: period,
+        recentMessages,
       },
     },
     token,
@@ -129,10 +130,6 @@ export async function sendCmd(deviceId, payload, token) {
 
 export async function getCmd(cmdId, token) {
   return apiFetch(`/api/cmd/${encodeURIComponent(cmdId)}`, { token });
-}
-
-export async function getHealth() {
-  return apiFetch("/api/health");
 }
 
 export async function getMailSetting(token) {

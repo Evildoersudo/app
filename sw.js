@@ -1,4 +1,4 @@
-const CACHE_NAME = "dorm-power-app-shell-v4";
+const CACHE_NAME = "dorm-power-app-shell-v9";
 const APP_SHELL = ["./", "./index.html", "./styles.css", "./main.js", "./api.js", "./store.js", "./manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {

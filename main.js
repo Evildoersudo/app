@@ -12,20 +12,23 @@ import {
   postAgentQuery,
   sendCmd,
   getCmd,
-  getHealth,
   getMailSetting,
   updateMailSetting,
-} from "./api.js";
+} from "./api.js?v=20260630f";
 import {
   store,
   setToken,
   addEvent,
   addAlert,
+  addAssistantMessage,
+  clearAssistantMessages,
   setDebugMode,
   setSelectedDeviceId,
   setTelemetryRange,
   setAlertPref,
-} from "./store.js";
+  setQuickActionState,
+  clearQuickActionStates,
+} from "./store.js?v=20260630f";
 
 const STATUS_POLL_INTERVAL_MS = 8000;
 const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
@@ -134,6 +137,7 @@ let bootstrapSeq = 0;
 let mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
 const customTypeDraftBySocket = new Map();
 const cmdWaiters = new Map();
+let deferredRender = false;
 
 if (!ALLOWED_RANGES.includes(store.telemetryRange)) {
   setTelemetryRange("1h");
@@ -463,6 +467,30 @@ function setGlobalBusy(next) {
   updateBadge();
 }
 
+function isEditingInput() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName?.toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || Boolean(el.isContentEditable);
+}
+
+function safeRender({ force = false } = {}) {
+  if (!force && isEditingInput()) {
+    deferredRender = true;
+    updateBadge();
+    updateTopDeviceInfo();
+    updateTabLabels();
+    return;
+  }
+  deferredRender = false;
+  render();
+}
+
+function flushDeferredRender() {
+  if (!deferredRender) return;
+  safeRender({ force: true });
+}
+
 function clearSessionAndRender(tip = "登录已过期，请重新登录") {
   setToken("");
   store.user = null;
@@ -473,6 +501,7 @@ function clearSessionAndRender(tip = "登录已过期，请重新登录") {
   store.behaviorEvents = [];
   store.devices = [];
   store.selectedDeviceId = "";
+  clearAssistantMessages();
   mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
   customTypeDraftBySocket.clear();
   try {
@@ -594,7 +623,7 @@ async function bootstrapData() {
     addAlert("SYSTEM", `初始化失败：${e.message}`, "err");
     setBanner(`初始化失败：${e.message}`);
   } finally {
-    if (seq === bootstrapSeq) render();
+    if (seq === bootstrapSeq) safeRender();
   }
 }
 
@@ -622,7 +651,7 @@ function connectWs() {
     wsRetryDelay = 1500;
     addEvent("SYSTEM", "WebSocket 已连接");
     updateBadge();
-    render();
+    safeRender();
   };
 
   ws.onerror = () => {
@@ -681,7 +710,7 @@ function onWsMessage(raw) {
   }
 
   updateBadge();
-  render();
+  safeRender();
 }
 
 function resolvePendingCmd(cmdId, state) {
@@ -782,7 +811,7 @@ async function executeCmd(payload, targetKey) {
 
 async function executeBulkSocketAction(action, { label = "", strong = false } = {}) {
   const sockets = store.deviceStatus?.sockets || [];
-  if (!sockets.length) return;
+  if (!sockets.length) return { state: "failed" };
 
   const desiredOn = action === "on";
   const targets = sockets.filter((s) => {
@@ -791,12 +820,12 @@ async function executeBulkSocketAction(action, { label = "", strong = false } = 
   });
   if (!targets.length) {
     showToast("无需变更");
-    return;
+    return { state: "noop", successCount: 0, failCount: 0 };
   }
 
   const msg = label || `将逐个插孔执行 ${targets.length} 条命令，确认继续吗？`;
   const ok = strong ? window.confirm(`${msg}\n\n请确认现场安全后再继续。`) : window.confirm(msg);
-  if (!ok) return;
+  if (!ok) return { state: "cancelled" };
 
   setGlobalBusy(true);
   let successCount = 0;
@@ -812,6 +841,60 @@ async function executeBulkSocketAction(action, { label = "", strong = false } = 
   setGlobalBusy(false);
   await bootstrapData();
   showToast(`完成：成功 ${successCount}，失败 ${failCount}`, 2600);
+  return { state: failCount > 0 ? "failed" : "success", successCount, failCount };
+}
+
+function quickActionState(actionKey) {
+  const entry = store.quickActionStates?.[actionKey];
+  const state = entry?.state || "idle";
+  const ageMs = Date.now() - Number(entry?.ts || 0);
+  const transientKeys = new Set(["quickAllOff", "quickCutoff", "allOn", "allOff"]);
+  if (transientKeys.has(actionKey) && state !== "pending" && ageMs > 3000) return "idle";
+  if ((actionKey === "quickSleep" || actionKey === "quickEco") && state !== "success" && state !== "pending" && ageMs > 3000) {
+    return "idle";
+  }
+  return state;
+}
+
+function hasOpenSockets() {
+  return (store.deviceStatus?.sockets || []).some((socket) => Boolean(socket.on));
+}
+
+function quickActionButton(actionKey, label, { tone = "neutral", disabled = false } = {}) {
+  const state = quickActionState(actionKey);
+  const statusText = {
+    idle: "",
+    pending: "执行中",
+    success: "已执行",
+    cancelled: "已取消",
+    failed: "失败",
+    noop: "无需变更",
+  }[state] || "";
+  const classes = ["btn", "quick-action", tone, state].filter(Boolean).join(" ");
+  return `
+    <button id="${actionKey}" class="${classes}" ${disabled || state === "pending" ? "disabled" : ""}>
+      <span>${escapeHtml(label)}</span>
+      ${statusText ? `<small>${escapeHtml(statusText)}</small>` : ""}
+    </button>
+  `;
+}
+
+function markQuickAction(actionKey, state) {
+  setQuickActionState(actionKey, state);
+  render();
+}
+
+function resetTransientQuickAction(actionKey, delayMs = 1600) {
+  window.setTimeout(() => {
+    if (quickActionState(actionKey) !== "pending") {
+      clearQuickActionStates([actionKey]);
+      safeRender();
+    }
+  }, delayMs);
+}
+
+function clearActiveModes() {
+  clearQuickActionStates(["quickSleep", "quickEco"]);
 }
 
 function calcUsageKwhFromTelemetry() {
@@ -1123,30 +1206,56 @@ function renderRecentReminders(limit = 3) {
 }
 
 function renderQuickActions() {
+  const disabled = !isOnline() || globalBusy;
+  const disableOffActions = disabled || !hasOpenSockets();
   return `
     <section class="card">
       <h3>快捷操作</h3>
       <div class="quick-grid">
-        <button id="quickAllOff" class="btn danger" ${!isOnline() || globalBusy ? "disabled" : ""}>全部关闭</button>
-        <button id="quickSleep" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>睡眠模式</button>
-        <button id="quickEco" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>一键节能</button>
-        <button id="quickCutoff" class="btn danger ghost" ${!isOnline() || globalBusy ? "disabled" : ""}>紧急断电</button>
+        ${quickActionButton("quickAllOff", "全部关闭", { tone: "danger", disabled: disableOffActions })}
+        ${quickActionButton("quickSleep", "睡眠模式", { tone: "primary", disabled })}
+        ${quickActionButton("quickEco", "一键节能", { tone: "primary", disabled })}
+        ${quickActionButton("quickCutoff", "紧急断电", { tone: "danger", disabled: disableOffActions })}
       </div>
     </section>
   `;
 }
 
 function renderAssistantCard() {
+  const messages = store.assistantMessages || [];
   return `
     <section class="card assistant-card">
       <div class="section-head">
-        <h3>轻量助手</h3>
-        ${store.assistantBusy ? pill("思考中", "warn") : pill("固定问题优先", "neutral")}
+        <h3>智能助手</h3>
+        ${store.assistantBusy ? pill("回复中", "warn") : pill("用户端", "neutral")}
+      </div>
+      <p class="small">只围绕你当前绑定的插排回答：用电状态、提醒原因、Unknown、待机浪费、保护断电和安全控制建议。</p>
+      <div class="assistant-chat" aria-live="polite">
+        ${
+          messages.length
+            ? messages
+              .map(
+                (msg) => `
+          <div class="chat-message ${msg.role === "user" ? "user" : "assistant"}">
+            <div class="chat-role">${msg.role === "user" ? "我" : "助手"}</div>
+            <div class="chat-bubble markdown-body">${msg.role === "assistant" ? renderMarkdown(msg.content) : escapeHtml(msg.content)}</div>
+          </div>
+        `,
+              )
+              .join("")
+            : "<div class='empty-state'>可以直接提问，例如“为什么提醒我？”或“哪些插孔可以省电？”</div>"
+        }
       </div>
       <div class="assistant-questions">
         ${ASSISTANT_QUESTIONS.map((q) => `<button class="btn assistant-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join("")}
       </div>
-      ${store.assistantReply ? `<div class="assistant-reply markdown-body">${renderMarkdown(store.assistantReply)}</div>` : ""}
+      <form id="assistantForm" class="assistant-form">
+        <input id="assistantInput" class="input" maxlength="500" placeholder="输入你的问题，例如：为什么插孔3被提醒？" ${store.assistantBusy ? "disabled" : ""} />
+        <button class="btn primary" type="submit" ${store.assistantBusy ? "disabled" : ""}>发送</button>
+      </form>
+      <div class="assistant-footer">
+        <button id="clearAssistantChat" class="link-btn" type="button">清空聊天</button>
+      </div>
     </section>
   `;
 }
@@ -1172,16 +1281,18 @@ function renderHome() {
 }
 
 function renderDevice() {
+  const disabled = !isOnline() || globalBusy;
+  const disableOffActions = disabled || !hasOpenSockets();
   return `
     ${deviceSelector()}
     <section class="card">
       <h3>安全控制</h3>
       <p class="small">普通操作可直接控制单个插孔；批量和高风险操作会要求确认。保护断电状态不会直接提供恢复供电按钮。</p>
       <div class="quick-grid">
-        <button id="allOff" class="btn danger" ${!isOnline() || globalBusy ? "disabled" : ""}>全部关闭</button>
-        <button id="allOn" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>全部开启</button>
-        <button id="quickSleep" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>睡眠模式</button>
-        <button id="quickEco" class="btn" ${!isOnline() || globalBusy ? "disabled" : ""}>一键节能</button>
+        ${quickActionButton("allOff", "全部关闭", { tone: "danger", disabled: disableOffActions })}
+        ${quickActionButton("allOn", "全部开启", { tone: "neutral", disabled })}
+        ${quickActionButton("quickSleep", "睡眠模式", { tone: "primary", disabled })}
+        ${quickActionButton("quickEco", "一键节能", { tone: "primary", disabled })}
       </div>
     </section>
     <section class="card">
@@ -1393,8 +1504,8 @@ function renderMe() {
       : ""
     }
     <section class="card">
-      <h3>系统健康</h3>
-      <div id="healthInfo" class="small">加载中...</div>
+      <h3>账户操作</h3>
+      <p class="small">如需切换账号或重新绑定设备，请退出后重新登录。</p>
       <div class="row"><button id="logoutBtn" class="btn">退出登录</button></div>
     </section>
   `;
@@ -1448,6 +1559,96 @@ function bindLogin() {
   }
 }
 
+async function submitAssistantQuestion(question) {
+  const text = String(question || "").trim();
+  if (!text || store.assistantBusy) return;
+
+  addAssistantMessage("user", text);
+  store.assistantBusy = true;
+  render();
+
+  try {
+    const recentMessages = (store.assistantMessages || [])
+      .slice(-8)
+      .map((msg) => `${msg.role === "user" ? "用户" : "助手"}：${msg.content}`);
+    const result = await postAgentQuery({
+      message: text,
+      roomId: selectedRoomId(),
+      deviceId: store.selectedDeviceId,
+      page: `pwa-user:${currentTab}`,
+      period: "7d",
+      recentMessages,
+    }, store.token);
+    addAssistantMessage("assistant", result?.reply || "暂时没有可用回答。");
+  } catch (err) {
+    if (handleAuthExpired(err)) return;
+    addAssistantMessage("assistant", `助手暂时不可用：${err.message}`);
+  } finally {
+    store.assistantBusy = false;
+    render();
+  }
+}
+
+async function runBulkQuickAction(actionKey, action, options = {}) {
+  markQuickAction(actionKey, "pending");
+  const result = await executeBulkSocketAction(action, options);
+  if (result?.state === "success") {
+    if (action === "off") clearActiveModes();
+    if (actionKey === "quickCutoff") {
+      clearQuickActionStates(["quickAllOff", "quickSleep", "quickEco", "allOn", "allOff"]);
+    }
+    markQuickAction(actionKey, "success");
+    resetTransientQuickAction(actionKey);
+    return;
+  }
+  if (result?.state === "noop") {
+    markQuickAction(actionKey, "noop");
+    resetTransientQuickAction(actionKey);
+    return;
+  }
+  markQuickAction(actionKey, result?.state || "cancelled");
+  resetTransientQuickAction(actionKey);
+}
+
+async function runModeQuickAction(actionKey, mode, otherModeKey) {
+  if (quickActionState(actionKey) === "success") {
+    if (!window.confirm(`确认取消${mode === "sleep" ? "睡眠模式" : "一键节能"}？`)) {
+      markQuickAction(actionKey, "success");
+      return;
+    }
+    markQuickAction(actionKey, "pending");
+    const result = await executeCmd({ action: "mode", mode: "normal" }, `${store.selectedDeviceId}:mode:normal`);
+    markQuickAction(actionKey, result.state === "success" ? "cancelled" : "failed");
+    resetTransientQuickAction(actionKey);
+    await bootstrapData();
+    return;
+  }
+
+  const label = mode === "sleep" ? "睡眠模式" : "一键节能";
+  const message =
+    mode === "sleep"
+      ? "确认下发睡眠模式？系统会按端侧策略关闭非必要插孔。"
+      : "确认下发一键节能？系统会优先处理待机浪费插孔。";
+  if (!window.confirm(message)) {
+    markQuickAction(actionKey, "cancelled");
+    resetTransientQuickAction(actionKey);
+    return;
+  }
+
+  clearQuickActionStates([otherModeKey]);
+  markQuickAction(actionKey, "pending");
+  const result = await executeCmd({ action: "mode", mode }, `${store.selectedDeviceId}:mode:${mode}`);
+  if (result.state === "success") {
+    clearQuickActionStates([otherModeKey]);
+    markQuickAction(actionKey, "success");
+    showToast(`${label}已开启`);
+  } else {
+    markQuickAction(actionKey, "failed");
+    resetTransientQuickAction(actionKey);
+  }
+  await bootstrapData();
+}
+
 function bindActions() {
   bindDeviceSelectorAndRefresh();
 
@@ -1483,34 +1684,35 @@ function bindActions() {
   });
 
   const quickAllOff = document.getElementById("quickAllOff");
-  if (quickAllOff) quickAllOff.onclick = () => executeBulkSocketAction("off", { label: "确认关闭全部已开启插孔？" });
+  if (quickAllOff) {
+    quickAllOff.onclick = () => runBulkQuickAction("quickAllOff", "off", { label: "确认关闭全部已开启插孔？" });
+  }
 
   const quickCutoff = document.getElementById("quickCutoff");
-  if (quickCutoff) quickCutoff.onclick = () => executeBulkSocketAction("off", { label: "紧急断电会关闭全部已开启插孔，确认继续？", strong: true });
+  if (quickCutoff) {
+    quickCutoff.onclick = () =>
+      runBulkQuickAction("quickCutoff", "off", { label: "紧急断电会关闭全部已开启插孔，确认继续？", strong: true });
+  }
 
   const quickSleep = document.getElementById("quickSleep");
   if (quickSleep) {
-    quickSleep.onclick = async () => {
-      if (!window.confirm("确认下发睡眠模式？系统会按端侧策略关闭非必要插孔。")) return;
-      await executeCmd({ action: "mode", mode: "sleep" }, `${store.selectedDeviceId}:mode:sleep`);
-      await bootstrapData();
-    };
+    quickSleep.onclick = () => runModeQuickAction("quickSleep", "sleep", "quickEco");
   }
 
   const quickEco = document.getElementById("quickEco");
   if (quickEco) {
-    quickEco.onclick = async () => {
-      if (!window.confirm("确认下发一键节能？系统会优先处理待机浪费插孔。")) return;
-      await executeCmd({ action: "mode", mode: "eco" }, `${store.selectedDeviceId}:mode:eco`);
-      await bootstrapData();
-    };
+    quickEco.onclick = () => runModeQuickAction("quickEco", "eco", "quickSleep");
   }
 
   const allOn = document.getElementById("allOn");
-  if (allOn) allOn.onclick = () => executeBulkSocketAction("on", { label: "全部开启属于中风险操作，确认继续？", strong: true });
+  if (allOn) {
+    allOn.onclick = () => runBulkQuickAction("allOn", "on", { label: "全部开启属于中风险操作，确认继续？", strong: true });
+  }
 
   const allOff = document.getElementById("allOff");
-  if (allOff) allOff.onclick = () => executeBulkSocketAction("off", { label: "确认关闭全部已开启插孔？" });
+  if (allOff) {
+    allOff.onclick = () => runBulkQuickAction("allOff", "off", { label: "确认关闭全部已开启插孔？" });
+  }
 
   document.querySelectorAll(".socket-toggle").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -1624,27 +1826,29 @@ function bindActions() {
   document.querySelectorAll(".assistant-question").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const question = btn.dataset.question || btn.textContent || "";
-      store.assistantBusy = true;
-      store.assistantReply = "";
-      render();
-      try {
-        const result = await postAgentQuery({
-          message: question,
-          roomId: selectedRoomId(),
-          deviceId: store.selectedDeviceId,
-          page: `pwa:${currentTab}`,
-          period: "7d",
-        }, store.token);
-        store.assistantReply = result?.reply || "暂时没有可用回答。";
-      } catch (err) {
-        if (handleAuthExpired(err)) return;
-        store.assistantReply = `助手暂时不可用：${err.message}`;
-      } finally {
-        store.assistantBusy = false;
-        render();
-      }
+      await submitAssistantQuestion(question);
     });
   });
+
+  const assistantForm = document.getElementById("assistantForm");
+  if (assistantForm) {
+    assistantForm.addEventListener("submit", async (evt) => {
+      evt.preventDefault();
+      const input = document.getElementById("assistantInput");
+      const question = input?.value || "";
+      if (input) input.value = "";
+      await submitAssistantQuestion(question);
+    });
+  }
+
+  const clearAssistantChat = document.getElementById("clearAssistantChat");
+  if (clearAssistantChat) {
+    clearAssistantChat.addEventListener("click", () => {
+      clearAssistantMessages();
+      showToast("聊天已清空");
+      render();
+    });
+  }
 
   const saveConnBtn = document.getElementById("saveConnBtn");
   if (saveConnBtn) {
@@ -1694,17 +1898,6 @@ function bindActions() {
     };
   }
 
-  const healthInfo = document.getElementById("healthInfo");
-  if (healthInfo) {
-    getHealth()
-      .then((h) => {
-        healthInfo.textContent = `后端=${h.ok ? "正常" : "异常"} | MQTT=${h.mqtt_connected ? "已连接" : "未连接"} | SMTP=${h.smtp_ready ? "已配置" : "未配置"} | 数据库=${h.database_url || "-"}`;
-      })
-      .catch((e) => {
-        healthInfo.textContent = `健康检查失败：${e.message}`;
-      });
-  }
-
   const logoutBtn = document.getElementById("logoutBtn");
   if (logoutBtn) {
     logoutBtn.onclick = () => {
@@ -1714,21 +1907,36 @@ function bindActions() {
 }
 
 function render() {
-  updateBadge();
-  updateTopDeviceInfo();
-  updateTabLabels();
+  try {
+    updateBadge();
+    updateTopDeviceInfo();
+    updateTabLabels();
 
-  if (!store.token) {
-    app.innerHTML = renderLogin();
-    bindLogin();
-    return;
+    if (!store.token) {
+      app.innerHTML = renderLogin();
+      bindLogin();
+      return;
+    }
+
+    if (currentTab === "home") app.innerHTML = renderHome();
+    if (currentTab === "device") app.innerHTML = renderDevice();
+    if (currentTab === "alerts") app.innerHTML = renderAlerts();
+    if (currentTab === "me") app.innerHTML = renderMe();
+    bindActions();
+  } catch (err) {
+    console.error("Render failed:", err);
+    app.innerHTML = `
+      <section class="card">
+        <h3>页面渲染失败</h3>
+        <p class="small">原因：${escapeHtml(err?.message || "未知错误")}</p>
+        <button id="resetAppBtn" class="btn danger">清除缓存并重试</button>
+      </section>
+    `;
+    document.getElementById("resetAppBtn")?.addEventListener("click", () => {
+      localStorage.clear();
+      window.location.reload();
+    });
   }
-
-  if (currentTab === "home") app.innerHTML = renderHome();
-  if (currentTab === "device") app.innerHTML = renderDevice();
-  if (currentTab === "alerts") app.innerHTML = renderAlerts();
-  if (currentTab === "me") app.innerHTML = renderMe();
-  bindActions();
 }
 
 function startStatusPolling() {
@@ -1742,7 +1950,7 @@ function startStatusPolling() {
       await refreshTelemetryIfNeeded(false);
       await refreshSupplementIfNeeded(false);
       updateBadge();
-      render();
+      safeRender();
     } catch (err) {
       if (handleAuthExpired(err)) return;
     } finally {
@@ -1769,6 +1977,16 @@ function bindGlobalListeners() {
   document.addEventListener("visibilitychange", async () => {
     if (!document.hidden && store.token && store.selectedDeviceId) {
       await bootstrapData();
+    }
+  });
+
+  document.addEventListener("focusout", () => {
+    window.setTimeout(flushDeferredRender, 0);
+  });
+
+  document.addEventListener("keydown", (evt) => {
+    if (evt.key === "Escape") {
+      flushDeferredRender();
     }
   });
 }
@@ -1815,8 +2033,16 @@ init().catch((err) => {
   }
 });
 
+function isLocalDevHost() {
+  return window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
+}
+
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("./sw.js?v=20260630").catch(() => null);
+    if (isLocalDevHost()) {
+      navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((reg) => reg.unregister())).catch(() => null);
+      return;
+    }
+    navigator.serviceWorker.register("./sw.js?v=20260630f").catch(() => null);
   });
 }
