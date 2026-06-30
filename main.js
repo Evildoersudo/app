@@ -174,6 +174,122 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
+function renderMarkdownInline(text) {
+  const parts = String(text || "").split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
+  return parts
+    .map((part) => {
+      if (part.startsWith("`") && part.endsWith("`")) {
+        return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
+      }
+      if (part.startsWith("**") && part.endsWith("**")) {
+        return `<strong>${escapeHtml(part.slice(2, -2))}</strong>`;
+      }
+      return escapeHtml(part);
+    })
+    .join("");
+}
+
+function normalizeAssistantMarkdown(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\s+(-\s+\*\*[^*]+?\*\*)/g, "\n$1")
+    .replace(/\s+(\d+\.\s+\*\*[^*]+?\*\*)/g, "\n$1")
+    .trim();
+}
+
+function renderMarkdown(text) {
+  const lines = normalizeAssistantMarkdown(text).split("\n");
+  const html = [];
+  let bulletItems = [];
+  let orderedItems = [];
+  let codeLines = [];
+  let inCode = false;
+
+  const flushBullets = () => {
+    if (!bulletItems.length) return;
+    html.push(`<ul>${bulletItems.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ul>`);
+    bulletItems = [];
+  };
+  const flushOrdered = () => {
+    if (!orderedItems.length) return;
+    html.push(`<ol>${orderedItems.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ol>`);
+    orderedItems = [];
+  };
+  const flushCode = () => {
+    if (!codeLines.length) return;
+    html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+    codeLines = [];
+  };
+
+  lines.forEach((rawLine) => {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      flushBullets();
+      flushOrdered();
+      if (inCode) {
+        flushCode();
+        inCode = false;
+      } else {
+        inCode = true;
+      }
+      return;
+    }
+
+    if (inCode) {
+      codeLines.push(rawLine);
+      return;
+    }
+
+    if (!trimmed) {
+      flushBullets();
+      flushOrdered();
+      return;
+    }
+
+    const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flushBullets();
+      flushOrdered();
+      const level = Math.min(heading[1].length, 4);
+      html.push(`<h${level}>${renderMarkdownInline(heading[2])}</h${level}>`);
+      return;
+    }
+
+    const bullet = trimmed.match(/^[-*]\s+(.*)$/);
+    if (bullet) {
+      flushOrdered();
+      bulletItems.push(bullet[1]);
+      return;
+    }
+
+    const ordered = trimmed.match(/^\d+\.\s+(.*)$/);
+    if (ordered) {
+      flushBullets();
+      orderedItems.push(ordered[1]);
+      return;
+    }
+
+    const quote = trimmed.match(/^>\s?(.*)$/);
+    if (quote) {
+      flushBullets();
+      flushOrdered();
+      html.push(`<blockquote>${renderMarkdownInline(quote[1])}</blockquote>`);
+      return;
+    }
+
+    flushBullets();
+    flushOrdered();
+    html.push(`<p>${renderMarkdownInline(trimmed)}</p>`);
+  });
+
+  flushBullets();
+  flushOrdered();
+  flushCode();
+  return html.join("");
+}
+
 function formatTime(ts) {
   const ms = Number(ts || 0) > 10_000_000_000 ? Number(ts) : Number(ts || 0) * 1000;
   return new Date(ms || Date.now()).toLocaleString("zh-CN", { hour12: false });
@@ -1030,7 +1146,7 @@ function renderAssistantCard() {
       <div class="assistant-questions">
         ${ASSISTANT_QUESTIONS.map((q) => `<button class="btn assistant-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join("")}
       </div>
-      ${store.assistantReply ? `<div class="assistant-reply">${escapeHtml(store.assistantReply)}</div>` : ""}
+      ${store.assistantReply ? `<div class="assistant-reply markdown-body">${renderMarkdown(store.assistantReply)}</div>` : ""}
     </section>
   `;
 }
