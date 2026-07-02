@@ -14,7 +14,7 @@ import {
   getCmd,
   getMailSetting,
   updateMailSetting,
-} from "./api.js?v=20260630f";
+} from "./api.js?v=20260702a";
 import {
   store,
   setToken,
@@ -28,7 +28,7 @@ import {
   setAlertPref,
   setQuickActionState,
   clearQuickActionStates,
-} from "./store.js?v=20260630f";
+} from "./store.js?v=20260702a";
 
 const STATUS_POLL_INTERVAL_MS = 8000;
 const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
@@ -1073,7 +1073,7 @@ function socketCardHtml(socket) {
       ${protectedCutoff ? `<div class="notice danger">该插孔已进入保护断电。请先确认接入设备是否正常，必要时联系管理员处理。</div>` : ""}
       ${learnPanelHtml(socket, pending || !isOnline() || globalBusy)}
       <div class="socket-actions">
-        <button data-socket-correct="${socket.id}" class="btn" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>重新识别</button>
+        <button data-socket-correct="${socket.id}" class="btn socket-correct" ${pending || !isOnline() || globalBusy ? "disabled" : ""}>重新识别</button>
         ${
           canToggle
             ? `<button data-socket="${socket.id}" data-action="${socket.on ? "off" : "on"}" class="btn ${socket.on ? "danger" : "primary"} socket-toggle" ${disabled ? "disabled" : ""}>${pending ? "执行中..." : actionText}</button>`
@@ -2043,6 +2043,6 @@ if ("serviceWorker" in navigator) {
       navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((reg) => reg.unregister())).catch(() => null);
       return;
     }
-    navigator.serviceWorker.register("./sw.js?v=20260630f").catch(() => null);
+    navigator.serviceWorker.register("./sw.js?v=20260702a").catch(() => null);
   });
 }
