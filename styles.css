@@ -960,6 +960,9 @@ p {
   gap: 10px;
   max-height: 420px;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
   margin-top: 12px;
   padding: 4px;
 }

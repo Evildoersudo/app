@@ -14,7 +14,7 @@ import {
   getCmd,
   getMailSetting,
   updateMailSetting,
-} from "./api.js?v=20260702a";
+} from "./api.js?v=20260712a";
 import {
   store,
   setToken,
@@ -28,7 +28,7 @@ import {
   setAlertPref,
   setQuickActionState,
   clearQuickActionStates,
-} from "./store.js?v=20260702a";
+} from "./store.js?v=20260712a";
 
 const STATUS_POLL_INTERVAL_MS = 8000;
 const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
@@ -138,6 +138,9 @@ let mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: fa
 const customTypeDraftBySocket = new Map();
 const cmdWaiters = new Map();
 let deferredRender = false;
+let assistantInteractionActive = false;
+let assistantInteractionTimer = null;
+let lastRenderedAssistantMessageCount = 0;
 
 if (!ALLOWED_RANGES.includes(store.telemetryRange)) {
   setTelemetryRange("1h");
@@ -474,8 +477,49 @@ function isEditingInput() {
   return tag === "input" || tag === "textarea" || tag === "select" || Boolean(el.isContentEditable);
 }
 
+function isAssistantChatTarget(target) {
+  return target instanceof Element && Boolean(target.closest(".assistant-chat"));
+}
+
+function holdAssistantInteraction() {
+  assistantInteractionActive = true;
+  if (assistantInteractionTimer) window.clearTimeout(assistantInteractionTimer);
+}
+
+function releaseAssistantInteraction(delayMs = 500) {
+  if (assistantInteractionTimer) window.clearTimeout(assistantInteractionTimer);
+  assistantInteractionTimer = window.setTimeout(() => {
+    assistantInteractionActive = false;
+    assistantInteractionTimer = null;
+    flushDeferredRender();
+  }, delayMs);
+}
+
+function captureAssistantScroll() {
+  const chat = document.querySelector(".assistant-chat");
+  if (!chat) return null;
+  return {
+    scrollTop: chat.scrollTop,
+    pinnedToBottom: chat.scrollHeight - chat.clientHeight - chat.scrollTop <= 24,
+  };
+}
+
+function restoreAssistantScroll(scrollState, messageCountChanged) {
+  const chat = document.querySelector(".assistant-chat");
+  if (!chat) return;
+
+  if (messageCountChanged && !assistantInteractionActive) {
+    chat.scrollTop = chat.scrollHeight;
+    return;
+  }
+
+  if (scrollState) {
+    chat.scrollTop = scrollState.pinnedToBottom ? chat.scrollHeight : scrollState.scrollTop;
+  }
+}
+
 function safeRender({ force = false } = {}) {
-  if (!force && isEditingInput()) {
+  if (!force && (isEditingInput() || assistantInteractionActive)) {
     deferredRender = true;
     updateBadge();
     updateTopDeviceInfo();
@@ -1907,6 +1951,9 @@ function bindActions() {
 }
 
 function render() {
+  const assistantScrollState = captureAssistantScroll();
+  const assistantMessageCount = (store.assistantMessages || []).length;
+  const assistantMessageCountChanged = assistantMessageCount !== lastRenderedAssistantMessageCount;
   try {
     updateBadge();
     updateTopDeviceInfo();
@@ -1923,6 +1970,8 @@ function render() {
     if (currentTab === "alerts") app.innerHTML = renderAlerts();
     if (currentTab === "me") app.innerHTML = renderMe();
     bindActions();
+    restoreAssistantScroll(assistantScrollState, assistantMessageCountChanged);
+    lastRenderedAssistantMessageCount = assistantMessageCount;
   } catch (err) {
     console.error("Render failed:", err);
     app.innerHTML = `
@@ -1984,6 +2033,26 @@ function bindGlobalListeners() {
     window.setTimeout(flushDeferredRender, 0);
   });
 
+  document.addEventListener("pointerdown", (evt) => {
+    if (isAssistantChatTarget(evt.target)) holdAssistantInteraction();
+  });
+
+  document.addEventListener("pointerup", (evt) => {
+    if (assistantInteractionActive || isAssistantChatTarget(evt.target)) {
+      releaseAssistantInteraction();
+    }
+  });
+
+  document.addEventListener("pointercancel", () => {
+    if (assistantInteractionActive) releaseAssistantInteraction();
+  });
+
+  document.addEventListener("scroll", (evt) => {
+    if (!isAssistantChatTarget(evt.target)) return;
+    holdAssistantInteraction();
+    releaseAssistantInteraction(700);
+  }, true);
+
   document.addEventListener("keydown", (evt) => {
     if (evt.key === "Escape") {
       flushDeferredRender();
@@ -2043,6 +2112,6 @@ if ("serviceWorker" in navigator) {
       navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((reg) => reg.unregister())).catch(() => null);
       return;
     }
-    navigator.serviceWorker.register("./sw.js?v=20260702a").catch(() => null);
+    navigator.serviceWorker.register("./sw.js?v=20260712a").catch(() => null);
   });
 }
