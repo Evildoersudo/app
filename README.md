@@ -1,7 +1,7 @@
 # Dorm Power 学生端（PWA）
 
 ## 目录说明
-- `index.html`: 页面骨架（4 个 Tab）。
+- `index.html`: 页面骨架（首页、插孔、习惯、提醒、我的 5 个 Tab）。
 - `main.js`: 页面渲染、状态管理、命令流程、WebSocket 处理。
 - `api.js`: REST 接口封装（支持 API/WS 地址配置）。
 - `store.js`: 前端状态存储与本地持久化。
@@ -28,6 +28,9 @@ python -m http.server 5173
 - `GET /api/devices`
 - `GET /api/devices/{id}/status`
 - `GET /api/telemetry`
+- `GET /api/v1/app/behavior/overview`
+- `GET /api/v1/app/behavior/habits/{profileId}`
+- `GET /api/v1/behavior/sessions`
 - `POST /api/strips/{id}/cmd`
 - `GET /api/cmd/{cmdId}`
 - `GET /health`

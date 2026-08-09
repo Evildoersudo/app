@@ -1,4 +1,4 @@
-const CACHE_NAME = "dorm-power-app-shell-v11";
+const CACHE_NAME = "dorm-power-app-shell-v12";
 const APP_SHELL = ["./", "./index.html", "./styles.css", "./main.js", "./api.js", "./store.js", "./manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
@@ -27,7 +27,7 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
 
   const isNavigation = req.mode === "navigate";
-  const isStaticAsset = APP_SHELL.some((path) => req.url.endsWith(path.replace("./", "/")));
+  const isStaticAsset = APP_SHELL.some((path) => url.pathname.endsWith(path.replace("./", "/")));
 
   if (isNavigation) {
     event.respondWith(

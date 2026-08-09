@@ -12,7 +12,7 @@ function readJson(storageKey, fallback) {
 
 export const store = {
   token: localStorage.getItem("dp_token") || "",
-  user: null,
+  user: readJson("dp_user", null),
   selectedDeviceId: localStorage.getItem("dp_selected_device_id") || "",
   telemetryRange: localStorage.getItem("dp_telemetry_range") || "1h",
   devices: [],
@@ -20,6 +20,16 @@ export const store = {
   telemetry: [],
   dailyCheckup: null,
   behaviorEvents: [],
+  behaviorOverview: null,
+  habitProfiles: [],
+  selectedHabitProfileId: null,
+  habitDetail: null,
+  behaviorSessions: [],
+  sessionCursor: null,
+  sessionSocketFilter: "",
+  behaviorLoading: false,
+  behaviorError: "",
+  behaviorLastUpdatedAt: 0,
   assistantMessages: readJson("dp_pwa_assistant_messages", []),
   assistantBusy: false,
   alertPrefs: readJson("dp_alert_prefs", {}),
@@ -31,6 +41,61 @@ export const store = {
   pendingCmdByTarget: new Map(),
   debugMode: localStorage.getItem("dp_debug_mode") === "1",
 };
+
+function behaviorCacheKey(username, deviceId) {
+  return `dp_behavior_cache:${String(username || "anonymous")}:${String(deviceId || "none")}`;
+}
+
+export function setCurrentUser(user) {
+  store.user = user || null;
+  if (store.user) localStorage.setItem("dp_user", JSON.stringify(store.user));
+  else localStorage.removeItem("dp_user");
+}
+
+export function loadBehaviorCache(username, deviceId) {
+  const cached = readJson(behaviorCacheKey(username, deviceId), null);
+  if (!cached) return false;
+  store.behaviorOverview = cached.overview || null;
+  store.habitProfiles = Array.isArray(cached.overview?.profiles) ? cached.overview.profiles : [];
+  store.selectedHabitProfileId = cached.selectedHabitProfileId ?? store.habitProfiles[0]?.profileId ?? null;
+  store.habitDetail = cached.habitDetail || null;
+  store.behaviorSessions = Array.isArray(cached.sessions) ? cached.sessions : [];
+  store.sessionCursor = cached.sessionCursor ?? null;
+  store.behaviorLastUpdatedAt = Number(cached.savedAt || 0);
+  return true;
+}
+
+export function saveBehaviorCache(username, deviceId) {
+  if (!username || !deviceId) return;
+  localStorage.setItem(
+    behaviorCacheKey(username, deviceId),
+    JSON.stringify({
+      overview: store.behaviorOverview,
+      selectedHabitProfileId: store.selectedHabitProfileId,
+      habitDetail: store.habitDetail,
+      sessions: store.behaviorSessions.slice(0, 40),
+      sessionCursor: store.sessionCursor,
+      savedAt: Date.now(),
+    }),
+  );
+}
+
+export function clearBehaviorCache(username = "") {
+  const prefix = username ? `dp_behavior_cache:${String(username)}:` : "dp_behavior_cache:";
+  Object.keys(localStorage).forEach((key) => {
+    if (key.startsWith(prefix)) localStorage.removeItem(key);
+  });
+  store.behaviorOverview = null;
+  store.habitProfiles = [];
+  store.selectedHabitProfileId = null;
+  store.habitDetail = null;
+  store.behaviorSessions = [];
+  store.sessionCursor = null;
+  store.sessionSocketFilter = "";
+  store.behaviorLoading = false;
+  store.behaviorError = "";
+  store.behaviorLastUpdatedAt = 0;
+}
 
 export function addEvent(type, detail, level = "info") {
   store.events.unshift({

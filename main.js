@@ -9,15 +9,19 @@ import {
   getTelemetry,
   getDailyCheckup,
   getBehaviorEvents,
+  getAppBehaviorOverview,
+  getAppHabit,
+  getBehaviorSessions,
   postAgentQuery,
   sendCmd,
   getCmd,
   getMailSetting,
   updateMailSetting,
-} from "./api.js?v=20260712a";
+} from "./api.js?v=20260809a";
 import {
   store,
   setToken,
+  setCurrentUser,
   addEvent,
   addAlert,
   addAssistantMessage,
@@ -28,11 +32,16 @@ import {
   setAlertPref,
   setQuickActionState,
   clearQuickActionStates,
-} from "./store.js?v=20260712a";
+  loadBehaviorCache,
+  saveBehaviorCache,
+  clearBehaviorCache,
+} from "./store.js?v=20260809a";
 
 const STATUS_POLL_INTERVAL_MS = 8000;
 const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
 const SUPPLEMENT_REFRESH_INTERVAL_MS = 20000;
+const BEHAVIOR_OVERVIEW_REFRESH_INTERVAL_MS = 60000;
+const HABIT_REFRESH_INTERVAL_MS = 300000;
 const LOGO_LONG_PRESS_MS = 5000;
 const ALLOWED_RANGES = ["1h", "24h", "7d", "30d"];
 const RANGE_LABELS = { "1h": "1小时", "24h": "24小时", "7d": "7天", "30d": "30天" };
@@ -96,6 +105,10 @@ const TAB_META = {
     label: "插孔",
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10a3 3 0 0 1 3 3v6a7 7 0 1 1-14 0V6a3 3 0 0 1 3-3m0 3v5h2V6zm8 0v5h2V6z"/></svg>`,
   },
+  habit: {
+    label: "习惯",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h16v2H4zm1-3h3V8H5zm5 0h4V3h-4zm6 0h3v-6h-3z"/></svg>`,
+  },
   alerts: {
     label: "提醒",
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 1.9 20.5A1 1 0 0 0 2.8 22h18.4a1 1 0 0 0 .9-1.5zM11 9h2v6h-2zm0 8h2v2h-2z"/></svg>`,
@@ -130,6 +143,8 @@ let statusPollTimer = null;
 let statusPolling = false;
 let lastTelemetryRefreshAt = 0;
 let lastSupplementRefreshAt = 0;
+let lastBehaviorOverviewRefreshAt = 0;
+let lastHabitRefreshAt = 0;
 let toastTimer = null;
 let logoPressTimer = null;
 let globalBusy = false;
@@ -140,6 +155,10 @@ const cmdWaiters = new Map();
 let deferredRender = false;
 let assistantInteractionActive = false;
 let assistantInteractionTimer = null;
+let habitInteractionActive = false;
+let habitInteractionTimer = null;
+let behaviorCacheDeviceId = "";
+let selectedHabitSlot = null;
 let lastRenderedAssistantMessageCount = 0;
 
 if (!ALLOWED_RANGES.includes(store.telemetryRange)) {
@@ -147,10 +166,11 @@ if (!ALLOWED_RANGES.includes(store.telemetryRange)) {
 }
 
 tabs.forEach((btn) => {
-  btn.addEventListener("click", () => {
+  btn.addEventListener("click", async () => {
     currentTab = btn.dataset.tab;
     tabs.forEach((b) => b.classList.toggle("active", b === btn));
     render();
+    if (currentTab === "habit") await enterHabitTab();
   });
 });
 
@@ -307,6 +327,33 @@ function formatDuration(seconds) {
   if (s < 60) return `${Math.round(s)}秒`;
   if (s < 3600) return `${Math.round(s / 60)}分钟`;
   return `${(s / 3600).toFixed(1)}小时`;
+}
+
+function formatBeijingTime(timestamp, fallback = "--") {
+  const value = Number(timestamp || 0);
+  if (!value) return fallback;
+  const shifted = new Date((value + 8 * 3600) * 1000);
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+}
+
+function useStateMeta(value, protectedCutoff = false) {
+  if (protectedCutoff) return { title: "保护断电", tone: "danger" };
+  if (value === "active") return { title: "使用中", tone: "ok" };
+  if (value === "standby") return { title: "待机", tone: "warn" };
+  return { title: "已关闭", tone: "neutral" };
+}
+
+function behaviorSocket(socketId) {
+  return (store.behaviorOverview?.sockets || []).find((item) => Number(item.socketId) === Number(socketId)) || null;
+}
+
+function liveDurationText(live) {
+  if (!live || live.useState === "off") return "";
+  if (!live.timeTrusted || !live.sessionStartTimestamp) return "本次上线后状态，开始时间待同步";
+  const serverNow = Number(store.behaviorOverview?.serverNow || Math.floor(Date.now() / 1000));
+  const elapsed = Math.max(0, serverNow + Math.floor((Date.now() - store.behaviorLastUpdatedAt) / 1000) - Number(live.sessionStartTimestamp));
+  return `已持续 ${formatDuration(elapsed)}`;
 }
 
 function selectedDevice() {
@@ -481,6 +528,10 @@ function isAssistantChatTarget(target) {
   return target instanceof Element && Boolean(target.closest(".assistant-chat"));
 }
 
+function isHabitInteractionTarget(target) {
+  return target instanceof Element && Boolean(target.closest(".habit-scroll, .habit-profile-tabs, .session-list"));
+}
+
 function holdAssistantInteraction() {
   assistantInteractionActive = true;
   if (assistantInteractionTimer) window.clearTimeout(assistantInteractionTimer);
@@ -493,6 +544,35 @@ function releaseAssistantInteraction(delayMs = 500) {
     assistantInteractionTimer = null;
     flushDeferredRender();
   }, delayMs);
+}
+
+function holdHabitInteraction() {
+  habitInteractionActive = true;
+  if (habitInteractionTimer) window.clearTimeout(habitInteractionTimer);
+}
+
+function releaseHabitInteraction(delayMs = 700) {
+  if (habitInteractionTimer) window.clearTimeout(habitInteractionTimer);
+  habitInteractionTimer = window.setTimeout(() => {
+    habitInteractionActive = false;
+    habitInteractionTimer = null;
+    flushDeferredRender();
+  }, delayMs);
+}
+
+function captureHabitScroll() {
+  if (currentTab !== "habit") return null;
+  const timeline = document.querySelector(".habit-scroll");
+  return { pageY: window.scrollY, timelineX: timeline?.scrollLeft || 0 };
+}
+
+function restoreHabitScroll(state) {
+  if (!state || currentTab !== "habit") return;
+  requestAnimationFrame(() => {
+    window.scrollTo({ top: state.pageY, behavior: "instant" });
+    const timeline = document.querySelector(".habit-scroll");
+    if (timeline) timeline.scrollLeft = state.timelineX;
+  });
 }
 
 function captureAssistantScroll() {
@@ -519,7 +599,7 @@ function restoreAssistantScroll(scrollState, messageCountChanged) {
 }
 
 function safeRender({ force = false } = {}) {
-  if (!force && (isEditingInput() || assistantInteractionActive)) {
+  if (!force && (isEditingInput() || assistantInteractionActive || habitInteractionActive)) {
     deferredRender = true;
     updateBadge();
     updateTopDeviceInfo();
@@ -536,8 +616,10 @@ function flushDeferredRender() {
 }
 
 function clearSessionAndRender(tip = "登录已过期，请重新登录") {
+  const previousUsername = behaviorCacheUsername();
   setToken("");
-  store.user = null;
+  clearBehaviorCache(previousUsername);
+  setCurrentUser(null);
   store.wsConnected = false;
   store.deviceStatus = null;
   store.telemetry = [];
@@ -545,6 +627,9 @@ function clearSessionAndRender(tip = "登录已过期，请重新登录") {
   store.behaviorEvents = [];
   store.devices = [];
   store.selectedDeviceId = "";
+  behaviorCacheDeviceId = "";
+  lastBehaviorOverviewRefreshAt = 0;
+  lastHabitRefreshAt = 0;
   clearAssistantMessages();
   mailPreference = { enabled: false, serviceEnabled: false, smtpConfigured: false, email: "", loaded: false };
   customTypeDraftBySocket.clear();
@@ -628,6 +713,115 @@ async function refreshSupplementIfNeeded(force = false) {
   lastSupplementRefreshAt = now;
 }
 
+function behaviorCacheUsername() {
+  return store.user?.username || "student";
+}
+
+function persistBehaviorState() {
+  if (!store.selectedDeviceId) return;
+  saveBehaviorCache(behaviorCacheUsername(), store.selectedDeviceId);
+}
+
+function restoreBehaviorState(deviceId) {
+  if (!deviceId || behaviorCacheDeviceId === deviceId) return;
+  behaviorCacheDeviceId = deviceId;
+  if (!loadBehaviorCache(behaviorCacheUsername(), deviceId)) {
+    store.behaviorOverview = null;
+    store.habitProfiles = [];
+    store.selectedHabitProfileId = null;
+    store.habitDetail = null;
+    store.behaviorSessions = [];
+    store.sessionCursor = null;
+  }
+}
+
+async function refreshBehaviorOverview(force = false) {
+  if (!store.token || !store.selectedDeviceId || !navigator.onLine) return;
+  const now = Date.now();
+  if (!force && now - lastBehaviorOverviewRefreshAt < BEHAVIOR_OVERVIEW_REFRESH_INTERVAL_MS) return;
+  store.behaviorLoading = !store.behaviorOverview;
+  try {
+    const overview = await getAppBehaviorOverview(store.selectedDeviceId, store.token);
+    if (overview?.device?.deviceId !== store.selectedDeviceId) return;
+    store.behaviorOverview = overview;
+    store.habitProfiles = Array.isArray(overview.profiles) ? overview.profiles : [];
+    if (!store.habitProfiles.some((item) => Number(item.profileId) === Number(store.selectedHabitProfileId))) {
+      store.selectedHabitProfileId = store.habitProfiles[0]?.profileId ?? null;
+      store.habitDetail = null;
+      lastHabitRefreshAt = 0;
+    }
+    store.behaviorError = "";
+    store.behaviorLastUpdatedAt = now;
+    lastBehaviorOverviewRefreshAt = now;
+    persistBehaviorState();
+  } catch (err) {
+    if (handleAuthExpired(err)) return;
+    store.behaviorError = err.message || "用电行为数据加载失败";
+  } finally {
+    store.behaviorLoading = false;
+  }
+}
+
+async function refreshHabitDetail(force = false) {
+  const profileId = store.selectedHabitProfileId;
+  if (!store.token || !store.selectedDeviceId || profileId == null || !navigator.onLine) return;
+  const now = Date.now();
+  if (!force && now - lastHabitRefreshAt < HABIT_REFRESH_INTERVAL_MS) return;
+  store.behaviorLoading = !store.habitDetail;
+  try {
+    const detail = await getAppHabit(store.selectedDeviceId, profileId, store.token);
+    if (Number(detail?.profile?.profileId) !== Number(store.selectedHabitProfileId)) return;
+    store.habitDetail = detail;
+    store.behaviorError = "";
+    store.behaviorLastUpdatedAt = now;
+    lastHabitRefreshAt = now;
+    persistBehaviorState();
+  } catch (err) {
+    if (handleAuthExpired(err)) return;
+    store.behaviorError = err.message || "7天习惯加载失败";
+  } finally {
+    store.behaviorLoading = false;
+  }
+}
+
+async function refreshBehaviorSessions({ reset = false } = {}) {
+  if (!store.token || !store.selectedDeviceId || !navigator.onLine) return;
+  const cursor = reset ? "" : store.sessionCursor ?? "";
+  if (!reset && cursor === null) return;
+  try {
+    const result = await getBehaviorSessions(
+      {
+        deviceId: store.selectedDeviceId,
+        socketId: store.sessionSocketFilter,
+        limit: 20,
+        cursor,
+      },
+      store.token,
+    );
+    const incoming = Array.isArray(result?.items) ? result.items : [];
+    if (reset) store.behaviorSessions = incoming;
+    else {
+      const known = new Set(store.behaviorSessions.map((item) => item.id));
+      store.behaviorSessions = [...store.behaviorSessions, ...incoming.filter((item) => !known.has(item.id))];
+    }
+    store.sessionCursor = result?.nextCursor ?? null;
+    persistBehaviorState();
+  } catch (err) {
+    if (handleAuthExpired(err)) return;
+    store.behaviorError = err.message || "用电会话加载失败";
+  }
+}
+
+async function enterHabitTab() {
+  if (!store.token || !store.selectedDeviceId) return;
+  store.behaviorLoading = true;
+  safeRender();
+  await refreshBehaviorOverview(false);
+  await Promise.all([refreshHabitDetail(false), refreshBehaviorSessions({ reset: true })]);
+  store.behaviorLoading = false;
+  safeRender();
+}
+
 async function bootstrapData() {
   if (!store.token) return;
   const seq = ++bootstrapSeq;
@@ -642,16 +836,25 @@ async function bootstrapData() {
     }
 
     if (store.selectedDeviceId) {
+      restoreBehaviorState(store.selectedDeviceId);
       const status = await getDeviceStatus(store.selectedDeviceId, store.token);
       if (seq !== bootstrapSeq) return;
       store.deviceStatus = status || null;
       await refreshTelemetryIfNeeded(true);
       await refreshSupplementIfNeeded(true);
+      await refreshBehaviorOverview(true);
+      if (currentTab === "habit") {
+        await Promise.all([refreshHabitDetail(true), refreshBehaviorSessions({ reset: true })]);
+      }
     } else {
       store.deviceStatus = null;
       store.telemetry = [];
       store.dailyCheckup = null;
       store.behaviorEvents = [];
+      store.behaviorOverview = null;
+      store.habitProfiles = [];
+      store.habitDetail = null;
+      store.behaviorSessions = [];
     }
     await refreshMailPreference();
 
@@ -690,11 +893,16 @@ function connectWs() {
   const ws = new WebSocket(getWsBase());
   store.wsClient = ws;
 
-  ws.onopen = () => {
+  ws.onopen = async () => {
     store.wsConnected = true;
     wsRetryDelay = 1500;
     addEvent("SYSTEM", "WebSocket 已连接");
     updateBadge();
+    safeRender();
+    await refreshBehaviorOverview(true);
+    if (currentTab === "habit") {
+      await Promise.all([refreshHabitDetail(true), refreshBehaviorSessions({ reset: true })]);
+    }
     safeRender();
   };
 
@@ -725,6 +933,7 @@ function onWsMessage(raw) {
 
   if (type === "DEVICE_STATUS" && raw.deviceId === store.selectedDeviceId) {
     store.deviceStatus = { ...(store.deviceStatus || {}), ...(raw.payload || {}), online: true };
+    mergeBehaviorOverviewStatus(raw.payload || {});
     setBanner("");
     addEvent("DEVICE_STATUS", "设备状态已更新");
   }
@@ -753,8 +962,67 @@ function onWsMessage(raw) {
     setBanner(`离线原因：${reason}`);
   }
 
+  if (type === "behavior.session.created" && raw.deviceId === store.selectedDeviceId) {
+    const item = raw.session;
+    if (item && (store.sessionSocketFilter === "" || Number(store.sessionSocketFilter) === Number(item.socketId))) {
+      store.behaviorSessions = [item, ...store.behaviorSessions.filter((row) => row.id !== item.id)];
+    }
+    lastBehaviorOverviewRefreshAt = 0;
+    refreshBehaviorOverview(true).then(() => {
+      persistBehaviorState();
+      safeRender();
+    }).catch(() => undefined);
+  }
+
+  if (String(type).startsWith("behavior.habit.") && raw.deviceId === store.selectedDeviceId) {
+    lastHabitRefreshAt = 0;
+    lastBehaviorOverviewRefreshAt = 0;
+    Promise.all([refreshBehaviorOverview(true), refreshHabitDetail(true)]).then(() => safeRender()).catch(() => undefined);
+  }
+
   updateBadge();
   safeRender();
+}
+
+function mergeBehaviorOverviewStatus(payload) {
+  const overview = store.behaviorOverview;
+  if (!overview) return;
+  const previous = new Map((overview.sockets || []).map((item) => [Number(item.socketId), item]));
+  const sockets = Array.isArray(payload.sockets) ? payload.sockets : [];
+  overview.device = {
+    ...overview.device,
+    online: true,
+    totalPowerW: Number(payload.total_power_w || 0),
+  };
+  overview.sockets = sockets.map((socket) => {
+    const old = previous.get(Number(socket.id)) || {};
+    const useState = ["off", "standby", "active"].includes(socket.useState) ? socket.useState : "off";
+    const startedAt = Number(socket.sessionStartTimestamp || 0);
+    return {
+      ...old,
+      socketId: Number(socket.id),
+      device: socket.device || "Unknown",
+      on: Boolean(socket.on),
+      useState,
+      powerW: Number(socket.power_w || 0),
+      sessionStartTimestamp: startedAt,
+      timeTrusted: Boolean(old.timeTrusted && ((useState === "off" && startedAt === 0) || (useState !== "off" && startedAt > 0))),
+      protectedCutoff: socket.bt === "protected_cutoff",
+    };
+  });
+  overview.counts = {
+    active: overview.sockets.filter((item) => item.useState === "active").length,
+    standby: overview.sockets.filter((item) => item.useState === "standby").length,
+    off: overview.sockets.filter((item) => item.useState === "off").length,
+    protectedCutoff: overview.sockets.filter((item) => item.protectedCutoff).length,
+  };
+  overview.serverNow = Math.floor(Date.now() / 1000);
+  store.behaviorLastUpdatedAt = Date.now();
+  if (store.habitDetail?.liveState?.socketId) {
+    const current = overview.sockets.find((item) => item.socketId === Number(store.habitDetail.liveState.socketId));
+    if (current) store.habitDetail.liveState = { ...store.habitDetail.liveState, ...current };
+  }
+  persistBehaviorState();
 }
 
 function resolvePendingCmd(cmdId, state) {
@@ -1045,11 +1313,13 @@ function socketSummaryCard(socket) {
   const b = socketBehavior(socket);
   const meta = behaviorMeta(b.tag);
   const tone = b.score > 0 ? levelMeta(b.level).tone : socket.on ? "ok" : "neutral";
+  const live = behaviorSocket(socket.id) || socket;
+  const state = useStateMeta(live.useState, live.protectedCutoff || b.tag === "protected_cutoff");
   return `
     <button class="socket-mini ${tone}" data-go-socket="${socket.id}">
       <span class="socket-mini-top">插孔 ${socket.id}</span>
       <strong>${escapeHtml(readableDeviceType(socket.device))}</strong>
-      <span>${Number(socket.power_w || 0).toFixed(1)}W · ${escapeHtml(meta.title)}</span>
+      <span>${Number(socket.power_w || 0).toFixed(1)}W · ${escapeHtml(state.title)}</span>
     </button>
   `;
 }
@@ -1085,12 +1355,15 @@ function socketCardHtml(socket) {
   const disabled = pending || !isOnline() || globalBusy || protectedCutoff;
   const canToggle = !protectedCutoff;
   const actionText = socket.on ? "关闭插孔" : "开启插孔";
+  const live = behaviorSocket(socket.id) || socket;
+  const useState = useStateMeta(live.useState, protectedCutoff || live.protectedCutoff);
+  const liveDuration = liveDurationText(live);
 
   return `
     <article class="socket-card ${socket.on ? "on" : "off"} ${pending ? "pending" : ""} ${level.tone}" data-socket-card="${socket.id}">
       <div class="socket-title">
         <strong>插孔 ${socket.id}</strong>
-        ${pending ? pill("执行中", "warn") : pill(socket.on ? "已开启" : "已关闭", socket.on ? "ok" : "neutral")}
+        ${pending ? pill("执行中", "warn") : pill(useState.title, useState.tone)}
       </div>
       <div class="socket-main">
         <div>
@@ -1109,6 +1382,7 @@ function socketCardHtml(socket) {
           : ""
       }
       <div class="socket-durations">
+        ${liveDuration ? `<span>${escapeHtml(liveDuration)}</span>` : ""}
         ${b.standbySeconds ? `<span>待机 ${formatDuration(b.standbySeconds)}</span>` : ""}
         ${b.highPowerSeconds ? `<span>高负载 ${formatDuration(b.highPowerSeconds)}</span>` : ""}
         ${b.unknownSeconds ? `<span>未识别 ${formatDuration(b.unknownSeconds)}</span>` : ""}
@@ -1304,10 +1578,210 @@ function renderAssistantCard() {
   `;
 }
 
+function renderBehaviorSummary() {
+  const overview = store.behaviorOverview;
+  if (!overview) {
+    return `
+      <section class="card behavior-summary-card">
+        <div class="section-head"><h3>我的用电状态</h3>${pill("学习中", "neutral")}</div>
+        <div class="empty-state">正在学习你的用电习惯，产生真实会话后会在这里展示。</div>
+      </section>
+    `;
+  }
+  const sockets = overview.sockets || [];
+  const focus = [...sockets].sort((a, b) => {
+    const rank = { active: 2, standby: 1, off: 0 };
+    return (rank[b.useState] || 0) - (rank[a.useState] || 0) || Number(b.powerW || 0) - Number(a.powerW || 0);
+  })[0];
+  const state = focus ? useStateMeta(focus.useState, focus.protectedCutoff) : useStateMeta("off");
+  const stats = overview.sevenDayStats || {};
+  const latest = overview.latestSession;
+  return `
+    <section class="card behavior-summary-card">
+      <div class="section-head">
+        <h3>我的用电状态</h3>
+        ${pill(state.title, state.tone)}
+      </div>
+      ${focus ? `
+        <div class="behavior-focus">
+          <div><span class="small">当前主要设备 · 插孔 ${focus.socketId}</span><strong>${escapeHtml(readableDeviceType(focus.device))}</strong></div>
+          <div class="behavior-focus-power">${Number(focus.powerW || 0).toFixed(1)}<span>W</span></div>
+        </div>
+        ${liveDurationText(focus) ? `<p class="small">${escapeHtml(liveDurationText(focus))}</p>` : ""}
+      ` : "<div class='empty-state'>暂未获取到插孔使用状态</div>"}
+      <div class="behavior-stat-grid">
+        <div><span>近7天会话</span><strong>${Number(stats.sessionCount || 0)}次</strong></div>
+        <div><span>活动时长</span><strong>${formatDuration(stats.activeSec || 0)}</strong></div>
+        <div><span>待机时长</span><strong>${formatDuration(stats.standbySec || 0)}</strong></div>
+        <div><span>会话电量</span><strong>${(Number(stats.energyWh || 0) / 1000).toFixed(3)}kWh</strong></div>
+      </div>
+      ${latest ? `<div class="latest-session-line">最近记录：${escapeHtml(readableDeviceType(latest.device))} · 插孔 ${latest.socketId} · ${formatDuration(latest.durationSec)} · ${formatBeijingTime(latest.receivedAt)}</div>` : `<div class="small">暂无真实会话，系统会继续在本地设备端学习。</div>`}
+      <button class="btn primary behavior-entry" data-go-tab="habit">查看用电习惯</button>
+    </section>
+  `;
+}
+
+function habitDateLabel(value) {
+  const text = String(value || "");
+  if (text.length !== 8) return "7日汇总";
+  const date = new Date(Date.UTC(Number(text.slice(0, 4)), Number(text.slice(4, 6)) - 1, Number(text.slice(6, 8))));
+  return `${text.slice(4, 6)}-${text.slice(6, 8)} 周${"日一二三四五六"[date.getUTCDay()]}`;
+}
+
+function habitSlotRange(slot) {
+  const start = slot * 15;
+  const label = (minutes) => `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+  return `${label(start)}-${label(start + 15)}`;
+}
+
+function habitSlotTone(slot) {
+  if (!slot || Number(slot.observedPct || 0) < 34) return "insufficient";
+  if (Number(slot.activePct || 0) === 0 && Number(slot.standbyPct || 0) === 0) return "idle";
+  if (Number(slot.standbyPct || 0) > Number(slot.activePct || 0)) return "standby";
+  return Number(slot.activePct || 0) > 60 ? "active-high" : "active";
+}
+
+function beijingDateSlot(timestamp, offsetMinutes = 480) {
+  const date = new Date((Number(timestamp || 0) + offsetMinutes * 60) * 1000);
+  return {
+    date: date.getUTCFullYear() * 10000 + (date.getUTCMonth() + 1) * 100 + date.getUTCDate(),
+    slot: Math.floor((date.getUTCHours() * 60 + date.getUTCMinutes()) / 15),
+  };
+}
+
+function habitOverlayKeys(detail) {
+  const keys = new Set();
+  const live = detail?.liveState;
+  if (!live?.matched || live.useState === "off") return keys;
+  const elapsed = Math.max(0, Math.floor((Date.now() - store.behaviorLastUpdatedAt) / 1000));
+  const end = Number(detail.serverNow || Math.floor(Date.now() / 1000)) + elapsed;
+  const start = live.timeTrusted && live.sessionStartTimestamp ? Number(live.sessionStartTimestamp) : end;
+  for (let cursor = Math.floor(start / 900) * 900; cursor <= end; cursor += 900) {
+    const point = beijingDateSlot(cursor, detail.timezoneOffsetMin);
+    keys.add(`${point.date}:${point.slot}`);
+  }
+  return keys;
+}
+
+function renderHabitTimeline(detail) {
+  const hasData = (detail.days || []).some((day) => day.available);
+  if (!hasData) return `<div class="empty-state">等待板端习惯数据，不会使用模拟数据填充。</div>`;
+  const overlays = habitOverlayKeys(detail);
+  const rows = [...detail.days, { date: 0, available: true, slots: detail.summarySlots || [] }];
+  return `
+    <div class="habit-scroll" aria-label="7天用电习惯时间带">
+      <div class="habit-chart">
+        <div class="habit-time-axis"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+        ${rows.map((day) => {
+          const summary = day.date === 0;
+          const slots = new Map((day.slots || []).map((slot) => [Number(slot.slot), slot]));
+          return `
+            <div class="habit-row">
+              <div class="habit-row-label">${habitDateLabel(day.date)}</div>
+              <div class="habit-slot-grid">
+                ${Array.from({ length: 96 }, (_, index) => {
+                  const slot = slots.get(index);
+                  const selected = selectedHabitSlot?.date === day.date && selectedHabitSlot?.slot === index;
+                  const live = !summary && overlays.has(`${day.date}:${index}`);
+                  return `<button class="habit-slot ${habitSlotTone(slot)} ${live ? `live-${detail.liveState.useState}` : ""} ${selected ? "selected" : ""}" data-habit-date="${day.date}" data-habit-slot="${index}" aria-label="${habitDateLabel(day.date)} ${habitSlotRange(index)}"></button>`;
+                }).join("")}
+              </div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function selectedHabitSlotHtml(detail) {
+  if (!selectedHabitSlot) return `<p class="small">点击时间格查看对应 15 分钟的活动、待机和观测比例。</p>`;
+  const day = selectedHabitSlot.date === 0
+    ? { slots: detail.summarySlots || [] }
+    : (detail.days || []).find((item) => Number(item.date) === Number(selectedHabitSlot.date));
+  const slot = day?.slots?.find((item) => Number(item.slot) === Number(selectedHabitSlot.slot));
+  return `
+    <div class="habit-slot-detail">
+      <strong>${habitDateLabel(selectedHabitSlot.date)} · ${habitSlotRange(selectedHabitSlot.slot)}</strong>
+      <span>活动 ${Number(slot?.activePct || 0)}%</span>
+      <span>待机 ${Number(slot?.standbyPct || 0)}%</span>
+      <span>有效观测 ${Number(slot?.observedPct || 0)}%</span>
+    </div>
+  `;
+}
+
+function renderSessionCard(item) {
+  const state = item.finalUseState === "active"
+    ? { title: "结束时活动", tone: "ok" }
+    : item.finalUseState === "standby"
+      ? { title: "结束时待机", tone: "warn" }
+      : { title: "会话已结束", tone: "neutral" };
+  return `
+    <article class="session-item">
+      <div class="session-head"><strong>${escapeHtml(readableDeviceType(item.device))}</strong>${pill(state.title, state.tone)}</div>
+      <div class="small">插孔 ${item.socketId} · 上报于 ${formatBeijingTime(item.receivedAt)}</div>
+      <div class="session-metrics">
+        <span>总计 ${formatDuration(item.durationSec)}</span>
+        <span>活动 ${formatDuration(item.activeSec)}</span>
+        <span>待机 ${formatDuration(item.standbySec)}</span>
+        <span>${Number(item.energyWh || 0).toFixed(2)}Wh</span>
+      </div>
+      <div class="small">平均 ${Number(item.avgPowerW || 0).toFixed(1)}W · 峰值 ${Number(item.peakPowerW || 0).toFixed(1)}W · 开关 ${Number(item.switchCount || 0)}次</div>
+    </article>
+  `;
+}
+
+function renderHabit() {
+  const detail = store.habitDetail;
+  const profiles = store.habitProfiles || [];
+  const offlineCache = !navigator.onLine;
+  return `
+    ${deviceSelector()}
+    ${offlineCache ? `<div class="notice warn">当前展示手机中最后保存的离线数据</div>` : ""}
+    <section class="card habit-card">
+      <div class="section-head">
+        <div><h3>我的用电习惯</h3><p class="small">来自插排端侧的真实学习结果</p></div>
+        <button id="refreshHabitBtn" class="btn" ${!navigator.onLine ? "disabled" : ""}>刷新</button>
+      </div>
+      ${profiles.length ? `
+        <div class="habit-profile-tabs">
+          ${profiles.map((item) => `<button class="habit-profile-tab ${Number(item.profileId) === Number(store.selectedHabitProfileId) ? "active" : ""}" data-habit-profile="${item.profileId}">${escapeHtml(readableDeviceType(item.device))}<small>${item.dataStatus === "ready" ? "已学习" : item.dataStatus === "error" ? "异常" : "学习中"}</small></button>`).join("")}
+        </div>
+      ` : `<div class="empty-state">还没有形成正式设备画像。你可以在“插孔”页提交实际设备类型，帮助系统继续学习。</div>`}
+      ${store.behaviorError ? `<div class="notice warn">${escapeHtml(store.behaviorError)}</div>` : ""}
+      ${detail ? `
+        <div class="habit-title-row">
+          <div><strong>${escapeHtml(readableDeviceType(detail.profile.device))}</strong><span class="small">常用时段：${escapeHtml(detail.profile.mainUsePeriod || "仍在学习")}</span></div>
+          ${pill(detail.dataStatus === "ready" ? "数据已就绪" : detail.dataStatus === "error" ? "同步异常" : "持续学习中", detail.dataStatus === "ready" ? "ok" : detail.dataStatus === "error" ? "danger" : "warn")}
+        </div>
+        ${detail.associationStatus === "ambiguous" ? `<div class="notice warn">存在同名设备，真实会话暂时无法唯一归属到这个画像。</div>` : ""}
+        <div class="behavior-stat-grid habit-stats">
+          <div><span>会话次数</span><strong>${Number(detail.sessionStats?.sessionCount || 0)}次</strong></div>
+          <div><span>活动时长</span><strong>${formatDuration(detail.sessionStats?.activeSec || 0)}</strong></div>
+          <div><span>待机时长</span><strong>${formatDuration(detail.sessionStats?.standbySec || 0)}</strong></div>
+          <div><span>会话电量</span><strong>${(Number(detail.sessionStats?.energyWh || 0) / 1000).toFixed(3)}kWh</strong></div>
+        </div>
+        ${renderHabitTimeline(detail)}
+        ${selectedHabitSlotHtml(detail)}
+        <div class="habit-legend"><span><i class="active-high"></i>活动</span><span><i class="standby"></i>待机</span><span><i class="idle"></i>未使用</span><span><i class="insufficient"></i>观测不足</span><span><i class="live"></i>当前运行</span></div>
+      ` : profiles.length ? `<div class="empty-state">${store.behaviorLoading ? "正在加载 7 天习惯..." : "等待板端习惯数据"}</div>` : ""}
+    </section>
+    <section class="card">
+      <div class="section-head"><h3>最近用电记录</h3>${pill(`${store.behaviorSessions.length}条`, "neutral")}</div>
+      <div class="session-filter-row">
+        ${["", 1, 2, 3, 4].map((value) => `<button class="btn session-filter ${String(store.sessionSocketFilter) === String(value) ? "primary" : ""}" data-session-socket="${value}">${value === "" ? "全部" : `插孔${value}`}</button>`).join("")}
+      </div>
+      <div class="session-list">${store.behaviorSessions.map(renderSessionCard).join("") || `<div class="empty-state">暂无真实用电会话</div>`}</div>
+      ${store.sessionCursor != null ? `<button id="loadMoreSessions" class="btn behavior-load-more">加载更多</button>` : ""}
+    </section>
+  `;
+}
+
 function renderHome() {
   return `
     ${deviceSelector()}
     ${renderStatusHero()}
+    ${renderBehaviorSummary()}
     ${renderDailyCheckup()}
     ${renderSocketOverview()}
     <section class="card">
@@ -1583,7 +2057,7 @@ function bindLogin() {
     try {
       const result = await login(account, password);
       setToken(result.token);
-      store.user = result.user || { username: account, role: "student" };
+      setCurrentUser(result.user || { username: account, role: "student" });
       addEvent("LOGIN", `登录成功：${store.user.username}`);
       showToast("登录成功");
       connectWs();
@@ -1708,12 +2182,69 @@ function bindActions() {
   });
 
   document.querySelectorAll("[data-go-tab]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       currentTab = btn.dataset.goTab;
       tabs.forEach((b) => b.classList.toggle("active", b.dataset.tab === currentTab));
       render();
+      if (currentTab === "habit") await enterHabitTab();
     });
   });
+
+  document.querySelectorAll(".habit-profile-tab").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const profileId = Number(btn.dataset.habitProfile);
+      if (!Number.isFinite(profileId) || profileId === Number(store.selectedHabitProfileId)) return;
+      store.selectedHabitProfileId = profileId;
+      store.habitDetail = null;
+      selectedHabitSlot = null;
+      lastHabitRefreshAt = 0;
+      persistBehaviorState();
+      render();
+      await refreshHabitDetail(true);
+      safeRender();
+    });
+  });
+
+  document.querySelectorAll(".habit-slot").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      selectedHabitSlot = { date: Number(btn.dataset.habitDate), slot: Number(btn.dataset.habitSlot) };
+      render();
+    });
+  });
+
+  document.querySelectorAll(".session-filter").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      store.sessionSocketFilter = btn.dataset.sessionSocket || "";
+      store.behaviorSessions = [];
+      store.sessionCursor = null;
+      render();
+      await refreshBehaviorSessions({ reset: true });
+      safeRender();
+    });
+  });
+
+  const loadMoreSessions = document.getElementById("loadMoreSessions");
+  if (loadMoreSessions) {
+    loadMoreSessions.addEventListener("click", async () => {
+      loadMoreSessions.disabled = true;
+      await refreshBehaviorSessions({ reset: false });
+      safeRender();
+    });
+  }
+
+  const refreshHabitBtn = document.getElementById("refreshHabitBtn");
+  if (refreshHabitBtn) {
+    refreshHabitBtn.addEventListener("click", async () => {
+      lastBehaviorOverviewRefreshAt = 0;
+      lastHabitRefreshAt = 0;
+      await Promise.all([
+        refreshBehaviorOverview(true),
+        refreshHabitDetail(true),
+        refreshBehaviorSessions({ reset: true }),
+      ]);
+      safeRender();
+    });
+  }
 
   document.querySelectorAll("[data-go-socket]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1952,6 +2483,7 @@ function bindActions() {
 
 function render() {
   const assistantScrollState = captureAssistantScroll();
+  const habitScrollState = captureHabitScroll();
   const assistantMessageCount = (store.assistantMessages || []).length;
   const assistantMessageCountChanged = assistantMessageCount !== lastRenderedAssistantMessageCount;
   try {
@@ -1967,10 +2499,12 @@ function render() {
 
     if (currentTab === "home") app.innerHTML = renderHome();
     if (currentTab === "device") app.innerHTML = renderDevice();
+    if (currentTab === "habit") app.innerHTML = renderHabit();
     if (currentTab === "alerts") app.innerHTML = renderAlerts();
     if (currentTab === "me") app.innerHTML = renderMe();
     bindActions();
     restoreAssistantScroll(assistantScrollState, assistantMessageCountChanged);
+    restoreHabitScroll(habitScrollState);
     lastRenderedAssistantMessageCount = assistantMessageCount;
   } catch (err) {
     console.error("Render failed:", err);
@@ -1998,6 +2532,8 @@ function startStatusPolling() {
       store.deviceStatus = await getDeviceStatus(store.selectedDeviceId, store.token);
       await refreshTelemetryIfNeeded(false);
       await refreshSupplementIfNeeded(false);
+      await refreshBehaviorOverview(false);
+      if (currentTab === "habit") await refreshHabitDetail(false);
       updateBadge();
       safeRender();
     } catch (err) {
@@ -2035,22 +2571,32 @@ function bindGlobalListeners() {
 
   document.addEventListener("pointerdown", (evt) => {
     if (isAssistantChatTarget(evt.target)) holdAssistantInteraction();
+    if (isHabitInteractionTarget(evt.target)) holdHabitInteraction();
   });
 
   document.addEventListener("pointerup", (evt) => {
     if (assistantInteractionActive || isAssistantChatTarget(evt.target)) {
       releaseAssistantInteraction();
     }
+    if (habitInteractionActive || isHabitInteractionTarget(evt.target)) {
+      releaseHabitInteraction();
+    }
   });
 
   document.addEventListener("pointercancel", () => {
     if (assistantInteractionActive) releaseAssistantInteraction();
+    if (habitInteractionActive) releaseHabitInteraction();
   });
 
   document.addEventListener("scroll", (evt) => {
-    if (!isAssistantChatTarget(evt.target)) return;
-    holdAssistantInteraction();
-    releaseAssistantInteraction(700);
+    if (isAssistantChatTarget(evt.target)) {
+      holdAssistantInteraction();
+      releaseAssistantInteraction(700);
+    }
+    if (isHabitInteractionTarget(evt.target)) {
+      holdHabitInteraction();
+      releaseHabitInteraction(900);
+    }
   }, true);
 
   document.addEventListener("keydown", (evt) => {
@@ -2112,6 +2658,6 @@ if ("serviceWorker" in navigator) {
       navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((reg) => reg.unregister())).catch(() => null);
       return;
     }
-    navigator.serviceWorker.register("./sw.js?v=20260712a").catch(() => null);
+    navigator.serviceWorker.register("./sw.js?v=20260809a").catch(() => null);
   });
 }

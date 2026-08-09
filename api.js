@@ -100,6 +100,23 @@ export async function getBehaviorEvents({ deviceId = "", roomId = "", limit = 50
   return apiFetch(`/api/behavior-events?${params.toString()}`, { token });
 }
 
+export async function getAppBehaviorOverview(deviceId, token) {
+  const params = new URLSearchParams({ deviceId });
+  return apiFetch(`/api/v1/app/behavior/overview?${params.toString()}`, { token });
+}
+
+export async function getAppHabit(deviceId, profileId, token) {
+  const params = new URLSearchParams({ deviceId });
+  return apiFetch(`/api/v1/app/behavior/habits/${encodeURIComponent(profileId)}?${params.toString()}`, { token });
+}
+
+export async function getBehaviorSessions({ deviceId, socketId = "", limit = 20, cursor = "" }, token) {
+  const params = new URLSearchParams({ deviceId, limit: String(limit) });
+  if (socketId !== "") params.set("socketId", String(socketId));
+  if (cursor !== "") params.set("cursor", String(cursor));
+  return apiFetch(`/api/v1/behavior/sessions?${params.toString()}`, { token });
+}
+
 export async function postAgentQuery({ message, roomId = "", deviceId = "", page = "pwa", period = "7d", recentMessages = [] }, token) {
   return apiFetch("/api/agent/query", {
     method: "POST",
