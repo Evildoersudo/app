@@ -248,7 +248,7 @@ export function setAlertPref(key, enabled) {
   localStorage.setItem("dp_alert_prefs", JSON.stringify(store.alertPrefs));
 }
 
-export function addAssistantMessage(role, content) {
+export function addAssistantMessage(role, content, metadata = {}) {
   const text = String(content || "").trim();
   if (!text) return;
   store.assistantMessages = [
@@ -258,6 +258,8 @@ export function addAssistantMessage(role, content) {
       role,
       content: text,
       ts: Date.now(),
+      sources: Array.isArray(metadata.sources) ? metadata.sources.slice(0, 4) : [],
+      usedTools: Array.isArray(metadata.usedTools) ? metadata.usedTools.slice(0, 3) : [],
     },
   ].slice(-30);
   localStorage.setItem("dp_pwa_assistant_messages", JSON.stringify(store.assistantMessages));

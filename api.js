@@ -117,7 +117,7 @@ export async function getBehaviorSessions({ deviceId, socketId = "", limit = 20,
   return apiFetch(`/api/v1/behavior/sessions?${params.toString()}`, { token });
 }
 
-export async function postAgentQuery({ message, roomId = "", deviceId = "", page = "pwa", period = "7d", recentMessages = [] }, token) {
+export async function postAgentQuery({ message, roomId = "", deviceId = "", page = "pwa", period = "7d", conversation = [] }, token) {
   return apiFetch("/api/agent/query", {
     method: "POST",
     body: {
@@ -129,11 +129,11 @@ export async function postAgentQuery({ message, roomId = "", deviceId = "", page
         roomId,
         deviceId,
         timeRange: period,
-        recentMessages,
+        conversation,
       },
     },
     token,
-    timeoutMs: 30000,
+    timeoutMs: 70000,
   });
 }
 

@@ -1664,6 +1664,12 @@ function renderAssistantCard() {
           <div class="chat-message ${msg.role === "user" ? "user" : "assistant"}">
             <div class="chat-role">${msg.role === "user" ? "我" : "助手"}</div>
             <div class="chat-bubble markdown-body">${msg.role === "assistant" ? renderMarkdown(msg.content) : escapeHtml(msg.content)}</div>
+            ${msg.role === "assistant" && Array.isArray(msg.sources) && msg.sources.length ? `
+              <div class="assistant-sources">
+                <strong>参考知识</strong>
+                ${msg.sources.map((source) => `<div>${escapeHtml(source.title || "知识条目")}${source.excerpt ? `：${escapeHtml(source.excerpt)}` : ""}</div>`).join("")}
+              </div>
+            ` : ""}
           </div>
         `,
               )
@@ -2245,18 +2251,22 @@ async function submitAssistantQuestion(question) {
   render();
 
   try {
-    const recentMessages = (store.assistantMessages || [])
-      .slice(-8)
-      .map((msg) => `${msg.role === "user" ? "用户" : "助手"}：${msg.content}`);
+    const conversation = (store.assistantMessages || [])
+      .slice(0, -1)
+      .slice(-10)
+      .map((msg) => ({ role: msg.role, content: String(msg.content || "").slice(0, 1500) }));
     const result = await postAgentQuery({
       message: text,
       roomId: selectedRoomId(),
       deviceId: store.selectedDeviceId,
       page: `pwa-user:${currentTab}`,
       period: "7d",
-      recentMessages,
+      conversation,
     }, store.token);
-    addAssistantMessage("assistant", result?.reply || "暂时没有可用回答。");
+    addAssistantMessage("assistant", result?.reply || "暂时没有可用回答。", {
+      sources: result?.sources || [],
+      usedTools: result?.usedTools || [],
+    });
   } catch (err) {
     if (handleAuthExpired(err)) return;
     addAssistantMessage("assistant", `助手暂时不可用：${err.message}`);

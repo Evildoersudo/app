@@ -1,11 +1,11 @@
-const CACHE_NAME = "dorm-power-app-shell-v13";
+const CACHE_NAME = "dorm-power-app-shell-v14";
 const CORE_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=20260809b",
-  "./main.js?v=20260809b",
-  "./api.js?v=20260809b",
-  "./store.js?v=20260809b",
+  "./styles.css?v=20260809c",
+  "./main.js?v=20260809c",
+  "./api.js?v=20260809c",
+  "./store.js?v=20260809c",
   "./manifest.webmanifest",
 ];
 const OPTIONAL_ASSETS = [

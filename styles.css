@@ -1407,6 +1407,23 @@ p {
   padding: 4px;
 }
 
+.assistant-sources {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid rgba(28, 101, 125, 0.18);
+  border-radius: 10px;
+  background: rgba(224, 244, 247, 0.55);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.assistant-sources strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+
 .chat-message {
   display: flex;
   flex-direction: column;
