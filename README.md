@@ -9,6 +9,13 @@
 - `manifest.webmanifest` / `sw.js`: PWA 配置与离线缓存。
 - `APP_FEATURE_API_OVERVIEW.md`: 项目主要功能与接口说明。
 
+## PWA 能力
+- 使用 `logo.png` 生成普通、maskable 和 Apple Touch 图标。
+- WebSocket 正常时每 60 秒进行一次 REST 状态校准，断开时每 8 秒校准。
+- 行为总览、7 天习惯和真实会话按用户与设备缓存到 IndexedDB。
+- Service Worker 提供应用壳离线缓存，并在新版本就绪时提示用户更新。
+- 习惯时间轴按 24 个小时触控块展示，每小时保留 4 个 15 分钟真实微格。
+
 ## 本地预览
 在 `e:\Embedded_competition\app\app` 执行：
 

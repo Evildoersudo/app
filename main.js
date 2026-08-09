@@ -17,7 +17,7 @@ import {
   getCmd,
   getMailSetting,
   updateMailSetting,
-} from "./api.js?v=20260809a";
+} from "./api.js?v=20260809b";
 import {
   store,
   setToken,
@@ -35,10 +35,12 @@ import {
   loadBehaviorCache,
   saveBehaviorCache,
   clearBehaviorCache,
-} from "./store.js?v=20260809a";
+} from "./store.js?v=20260809b";
 
-const STATUS_POLL_INTERVAL_MS = 8000;
-const TELEMETRY_REFRESH_INTERVAL_MS = 12000;
+const STATUS_POLL_CONNECTED_MS = 60000;
+const STATUS_POLL_DISCONNECTED_MS = 8000;
+const TELEMETRY_REFRESH_CONNECTED_MS = 60000;
+const TELEMETRY_REFRESH_DISCONNECTED_MS = 12000;
 const SUPPLEMENT_REFRESH_INTERVAL_MS = 20000;
 const BEHAVIOR_OVERVIEW_REFRESH_INTERVAL_MS = 60000;
 const HABIT_REFRESH_INTERVAL_MS = 300000;
@@ -132,6 +134,8 @@ const app = document.getElementById("app");
 const offlineBanner = document.getElementById("offlineBanner");
 const onlineBadge = document.getElementById("onlineBadge");
 const toastNode = document.getElementById("toast");
+const updateBanner = document.getElementById("updateBanner");
+const applyUpdateBtn = document.getElementById("applyUpdateBtn");
 const tabs = [...document.querySelectorAll(".tab")];
 const topLogo = document.querySelector(".top-logo");
 
@@ -141,6 +145,8 @@ let wsRetryTimer = null;
 let wsRetryDelay = 1500;
 let statusPollTimer = null;
 let statusPolling = false;
+let statusPollFailureCount = 0;
+let lastStatusRefreshAt = 0;
 let lastTelemetryRefreshAt = 0;
 let lastSupplementRefreshAt = 0;
 let lastBehaviorOverviewRefreshAt = 0;
@@ -159,7 +165,12 @@ let habitInteractionActive = false;
 let habitInteractionTimer = null;
 let behaviorCacheDeviceId = "";
 let selectedHabitSlot = null;
+let selectedHabitHour = null;
+let habitViewFilter = "all";
 let lastRenderedAssistantMessageCount = 0;
+let pendingServiceWorker = null;
+let serviceWorkerReloading = false;
+let deferredInstallPrompt = null;
 
 if (!ALLOWED_RANGES.includes(store.telemetryRange)) {
   setTelemetryRange("1h");
@@ -498,6 +509,10 @@ function updateTabLabels() {
     const id = tab.dataset.tab;
     const meta = TAB_META[id];
     if (!meta) return;
+    const active = id === currentTab;
+    tab.classList.toggle("active", active);
+    if (active) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
     const badge =
       id === "alerts" && count > 0
         ? `<span class="tab-badge">${count > 99 ? "99+" : count}</span>`
@@ -678,8 +693,12 @@ async function refreshMailPreference() {
 async function refreshTelemetryIfNeeded(force = false) {
   if (!store.token || !store.selectedDeviceId) return;
   const now = Date.now();
-  if (!force && now - lastTelemetryRefreshAt < TELEMETRY_REFRESH_INTERVAL_MS) return;
-  const telemetry = await getTelemetry(store.selectedDeviceId, store.telemetryRange, store.token);
+  const interval = store.wsConnected ? TELEMETRY_REFRESH_CONNECTED_MS : TELEMETRY_REFRESH_DISCONNECTED_MS;
+  if (!force && now - lastTelemetryRefreshAt < interval) return;
+  const deviceId = store.selectedDeviceId;
+  const range = store.telemetryRange;
+  const telemetry = await getTelemetry(deviceId, range, store.token);
+  if (deviceId !== store.selectedDeviceId || range !== store.telemetryRange) return;
   store.telemetry = Array.isArray(telemetry) ? telemetry : [];
   lastTelemetryRefreshAt = now;
 }
@@ -719,13 +738,13 @@ function behaviorCacheUsername() {
 
 function persistBehaviorState() {
   if (!store.selectedDeviceId) return;
-  saveBehaviorCache(behaviorCacheUsername(), store.selectedDeviceId);
+  saveBehaviorCache(behaviorCacheUsername(), store.selectedDeviceId).catch(() => undefined);
 }
 
-function restoreBehaviorState(deviceId) {
+async function restoreBehaviorState(deviceId) {
   if (!deviceId || behaviorCacheDeviceId === deviceId) return;
   behaviorCacheDeviceId = deviceId;
-  if (!loadBehaviorCache(behaviorCacheUsername(), deviceId)) {
+  if (!(await loadBehaviorCache(behaviorCacheUsername(), deviceId))) {
     store.behaviorOverview = null;
     store.habitProfiles = [];
     store.selectedHabitProfileId = null;
@@ -788,16 +807,19 @@ async function refreshBehaviorSessions({ reset = false } = {}) {
   if (!store.token || !store.selectedDeviceId || !navigator.onLine) return;
   const cursor = reset ? "" : store.sessionCursor ?? "";
   if (!reset && cursor === null) return;
+  const deviceId = store.selectedDeviceId;
+  const socketFilter = store.sessionSocketFilter;
   try {
     const result = await getBehaviorSessions(
       {
-        deviceId: store.selectedDeviceId,
-        socketId: store.sessionSocketFilter,
+        deviceId,
+        socketId: socketFilter,
         limit: 20,
         cursor,
       },
       store.token,
     );
+    if (deviceId !== store.selectedDeviceId || socketFilter !== store.sessionSocketFilter) return;
     const incoming = Array.isArray(result?.items) ? result.items : [];
     if (reset) store.behaviorSessions = incoming;
     else {
@@ -836,10 +858,11 @@ async function bootstrapData() {
     }
 
     if (store.selectedDeviceId) {
-      restoreBehaviorState(store.selectedDeviceId);
+      await restoreBehaviorState(store.selectedDeviceId);
       const status = await getDeviceStatus(store.selectedDeviceId, store.token);
       if (seq !== bootstrapSeq) return;
       store.deviceStatus = status || null;
+      lastStatusRefreshAt = Date.now();
       await refreshTelemetryIfNeeded(true);
       await refreshSupplementIfNeeded(true);
       await refreshBehaviorOverview(true);
@@ -894,10 +917,13 @@ function connectWs() {
   store.wsClient = ws;
 
   ws.onopen = async () => {
+    if (store.wsClient !== ws) return;
     store.wsConnected = true;
+    statusPollFailureCount = 0;
     wsRetryDelay = 1500;
     addEvent("SYSTEM", "WebSocket 已连接");
     updateBadge();
+    scheduleStatusPolling(STATUS_POLL_CONNECTED_MS);
     safeRender();
     await refreshBehaviorOverview(true);
     if (currentTab === "habit") {
@@ -907,14 +933,17 @@ function connectWs() {
   };
 
   ws.onerror = () => {
+    if (store.wsClient !== ws) return;
     store.wsConnected = false;
     updateBadge();
   };
 
   ws.onclose = () => {
+    if (store.wsClient !== ws) return;
     store.wsConnected = false;
-    wsRetryDelay = Math.min(15000, Math.floor(wsRetryDelay * 1.8));
+    wsRetryDelay = Math.min(60000, Math.floor(wsRetryDelay * 1.8));
     updateBadge();
+    scheduleStatusPolling(0);
     scheduleReconnect();
   };
 
@@ -936,6 +965,7 @@ function onWsMessage(raw) {
     mergeBehaviorOverviewStatus(raw.payload || {});
     setBanner("");
     addEvent("DEVICE_STATUS", "设备状态已更新");
+    lastStatusRefreshAt = Date.now();
   }
 
   if (type === "TELEMETRY" && raw.deviceId === store.selectedDeviceId) {
@@ -981,7 +1011,11 @@ function onWsMessage(raw) {
   }
 
   updateBadge();
-  safeRender();
+  if (type === "DEVICE_STATUS" || type === "TELEMETRY" || type === "DEVICE_OFFLINE") {
+    updateRealtimeDom(type);
+  } else {
+    safeRender();
+  }
 }
 
 function mergeBehaviorOverviewStatus(payload) {
@@ -1023,6 +1057,79 @@ function mergeBehaviorOverviewStatus(payload) {
     if (current) store.habitDetail.liveState = { ...store.habitDetail.liveState, ...current };
   }
   persistBehaviorState();
+}
+
+function updateHabitLiveOverlay() {
+  if (currentTab !== "habit" || !store.habitDetail) return;
+  const overlays = habitOverlayKeys(store.habitDetail);
+  const liveState = store.habitDetail.liveState?.useState;
+  document.querySelectorAll(".habit-slot[data-habit-date]").forEach((node) => {
+    node.classList.remove("live-active", "live-standby");
+    const date = Number(node.dataset.habitDate);
+    const slot = Number(node.dataset.habitSlot);
+    if (date !== 0 && overlays.has(`${date}:${slot}`) && (liveState === "active" || liveState === "standby")) {
+      node.classList.add(`live-${liveState}`);
+    }
+  });
+}
+
+function updateRealtimeDom(type = "DEVICE_STATUS") {
+  updateTopDeviceInfo();
+  const online = isOnline();
+  document.querySelectorAll("[data-live-status-title]").forEach((node) => {
+    node.textContent = statusTitle();
+  });
+  document.querySelectorAll("[data-live-status-subtitle]").forEach((node) => {
+    node.textContent = statusSubtitle();
+  });
+  document.querySelectorAll("[data-live-device-online]").forEach((node) => {
+    node.className = `pill ${online ? "ok" : "neutral"}`;
+    node.textContent = online ? "在线" : "离线";
+  });
+  document.querySelectorAll("[data-live-total-power]").forEach((node) => {
+    node.textContent = `${currentPowerW().toFixed(1)}W`;
+  });
+
+  const sockets = store.deviceStatus?.sockets || [];
+  sockets.forEach((socket) => {
+    const id = Number(socket.id);
+    const behavior = socketBehavior(socket);
+    const live = behaviorSocket(id) || socket;
+    const state = useStateMeta(live.useState, live.protectedCutoff || behavior.tag === "protected_cutoff");
+    const name = readableDeviceType(socket.device);
+    document.querySelectorAll(`[data-live-socket-name="${id}"]`).forEach((node) => {
+      node.textContent = name;
+    });
+    document.querySelectorAll(`[data-live-socket-summary="${id}"]`).forEach((node) => {
+      node.textContent = `${Number(socket.power_w || 0).toFixed(1)}W · ${state.title}`;
+    });
+    document.querySelectorAll(`[data-live-socket-power="${id}"]`).forEach((node) => {
+      node.innerHTML = `${Number(socket.power_w || 0).toFixed(1)}<span>W</span>`;
+    });
+    document.querySelectorAll(`[data-live-socket-state="${id}"]`).forEach((node) => {
+      node.className = `pill ${state.tone}`;
+      node.textContent = state.title;
+    });
+  });
+
+  const focus = focusSocket();
+  if (focus) {
+    document.querySelectorAll("[data-live-focus-socket]").forEach((node) => {
+      node.textContent = `当前主要设备 · 插孔 ${focus.id || focus.socketId}`;
+    });
+    document.querySelectorAll("[data-live-focus-name]").forEach((node) => {
+      node.textContent = readableDeviceType(focus.device);
+    });
+    document.querySelectorAll("[data-live-focus-power]").forEach((node) => {
+      node.innerHTML = `${Number(focus.power_w ?? focus.powerW ?? 0).toFixed(1)}<span>W</span>`;
+    });
+  }
+
+  if (type === "TELEMETRY") {
+    const chart = document.getElementById("telemetryLiveRegion");
+    if (chart) chart.innerHTML = telemetryChart({ compact: true });
+  }
+  updateHabitLiveOverlay();
 }
 
 function resolvePendingCmd(cmdId, state) {
@@ -1318,8 +1425,8 @@ function socketSummaryCard(socket) {
   return `
     <button class="socket-mini ${tone}" data-go-socket="${socket.id}">
       <span class="socket-mini-top">插孔 ${socket.id}</span>
-      <strong>${escapeHtml(readableDeviceType(socket.device))}</strong>
-      <span>${Number(socket.power_w || 0).toFixed(1)}W · ${escapeHtml(state.title)}</span>
+      <strong data-live-socket-name="${socket.id}">${escapeHtml(readableDeviceType(socket.device))}</strong>
+      <span data-live-socket-summary="${socket.id}">${Number(socket.power_w || 0).toFixed(1)}W · ${escapeHtml(state.title)}</span>
     </button>
   `;
 }
@@ -1363,12 +1470,12 @@ function socketCardHtml(socket) {
     <article class="socket-card ${socket.on ? "on" : "off"} ${pending ? "pending" : ""} ${level.tone}" data-socket-card="${socket.id}">
       <div class="socket-title">
         <strong>插孔 ${socket.id}</strong>
-        ${pending ? pill("执行中", "warn") : pill(useState.title, useState.tone)}
+        ${pending ? pill("执行中", "warn") : `<span class="pill ${useState.tone}" data-live-socket-state="${socket.id}">${escapeHtml(useState.title)}</span>`}
       </div>
       <div class="socket-main">
         <div>
-          <div class="socket-power">${Number(socket.power_w || 0).toFixed(1)}<span>W</span></div>
-          <div class="small">设备：${escapeHtml(readableDeviceType(socket.device))}</div>
+          <div class="socket-power" data-live-socket-power="${socket.id}">${Number(socket.power_w || 0).toFixed(1)}<span>W</span></div>
+          <div class="small">设备：<span data-live-socket-name="${socket.id}">${escapeHtml(readableDeviceType(socket.device))}</span></div>
         </div>
         <div class="socket-risk">
           ${pill(meta.title, level.tone)}
@@ -1435,13 +1542,13 @@ function renderStatusHero() {
       <div class="hero-top">
         <div>
           <div class="hero-title">${escapeHtml(d?.name || d?.id || "智能插排")}</div>
-          <h2>${escapeHtml(statusTitle())}</h2>
+          <h2 data-live-status-title>${escapeHtml(statusTitle())}</h2>
         </div>
-        ${pill(isOnline() ? "在线" : "离线", isOnline() ? "ok" : "neutral")}
+        <span class="pill ${isOnline() ? "ok" : "neutral"}" data-live-device-online>${isOnline() ? "在线" : "离线"}</span>
       </div>
-      <p>${escapeHtml(statusSubtitle())}</p>
+      <p data-live-status-subtitle>${escapeHtml(statusSubtitle())}</p>
       <div class="hero-metrics">
-        <div><span>当前功率</span><strong>${currentPowerW().toFixed(1)}W</strong></div>
+        <div><span>当前功率</span><strong data-live-total-power>${currentPowerW().toFixed(1)}W</strong></div>
         <div><span>区间电量</span><strong>${todayKwh}kWh</strong></div>
         <div><span>风险分</span><strong>${b.risk}</strong></div>
       </div>
@@ -1604,8 +1711,8 @@ function renderBehaviorSummary() {
       </div>
       ${focus ? `
         <div class="behavior-focus">
-          <div><span class="small">当前主要设备 · 插孔 ${focus.socketId}</span><strong>${escapeHtml(readableDeviceType(focus.device))}</strong></div>
-          <div class="behavior-focus-power">${Number(focus.powerW || 0).toFixed(1)}<span>W</span></div>
+          <div><span class="small" data-live-focus-socket>当前主要设备 · 插孔 ${focus.socketId}</span><strong data-live-focus-name>${escapeHtml(readableDeviceType(focus.device))}</strong></div>
+          <div class="behavior-focus-power" data-live-focus-power>${Number(focus.powerW || 0).toFixed(1)}<span>W</span></div>
         </div>
         ${liveDurationText(focus) ? `<p class="small">${escapeHtml(liveDurationText(focus))}</p>` : ""}
       ` : "<div class='empty-state'>暂未获取到插孔使用状态</div>"}
@@ -1639,6 +1746,23 @@ function habitSlotTone(slot) {
   if (Number(slot.activePct || 0) === 0 && Number(slot.standbyPct || 0) === 0) return "idle";
   if (Number(slot.standbyPct || 0) > Number(slot.activePct || 0)) return "standby";
   return Number(slot.activePct || 0) > 60 ? "active-high" : "active";
+}
+
+function habitSlotMatchesFilter(slot, index) {
+  if (habitViewFilter === "all") return true;
+  if (habitViewFilter === "evening") return index >= 72;
+  const tone = habitSlotTone(slot);
+  if (habitViewFilter === "active") return tone === "active" || tone === "active-high";
+  if (habitViewFilter === "standby") return tone === "standby";
+  return true;
+}
+
+function habitSlotToneLabel(slot) {
+  const tone = habitSlotTone(slot);
+  if (tone === "active" || tone === "active-high") return "活动";
+  if (tone === "standby") return "待机";
+  if (tone === "idle") return "未使用";
+  return "观测不足";
 }
 
 function beijingDateSlot(timestamp, offsetMinutes = 480) {
@@ -1678,12 +1802,22 @@ function renderHabitTimeline(detail) {
           return `
             <div class="habit-row">
               <div class="habit-row-label">${habitDateLabel(day.date)}</div>
-              <div class="habit-slot-grid">
-                ${Array.from({ length: 96 }, (_, index) => {
-                  const slot = slots.get(index);
-                  const selected = selectedHabitSlot?.date === day.date && selectedHabitSlot?.slot === index;
-                  const live = !summary && overlays.has(`${day.date}:${index}`);
-                  return `<button class="habit-slot ${habitSlotTone(slot)} ${live ? `live-${detail.liveState.useState}` : ""} ${selected ? "selected" : ""}" data-habit-date="${day.date}" data-habit-slot="${index}" aria-label="${habitDateLabel(day.date)} ${habitSlotRange(index)}"></button>`;
+              <div class="habit-hour-grid">
+                ${Array.from({ length: 24 }, (_, hour) => {
+                  const selected = selectedHabitHour?.date === day.date && selectedHabitHour?.hour === hour;
+                  const hourSummary = Array.from({ length: 4 }, (_, quarter) => {
+                    const index = hour * 4 + quarter;
+                    return `${habitSlotRange(index)} ${habitSlotToneLabel(slots.get(index))}`;
+                  }).join("，");
+                  return `<button class="habit-hour ${selected ? "selected" : ""}" data-habit-date="${day.date}" data-habit-hour="${hour}" aria-label="${habitDateLabel(day.date)}，${hourSummary}">
+                    ${Array.from({ length: 4 }, (_, quarter) => {
+                      const index = hour * 4 + quarter;
+                      const slot = slots.get(index);
+                      const live = !summary && overlays.has(`${day.date}:${index}`);
+                      const muted = !habitSlotMatchesFilter(slot, index);
+                      return `<span class="habit-slot ${habitSlotTone(slot)} ${live ? `live-${detail.liveState.useState}` : ""} ${muted ? "filter-muted" : ""}" data-habit-date="${day.date}" data-habit-slot="${index}"></span>`;
+                    }).join("")}
+                  </button>`;
                 }).join("")}
               </div>
             </div>
@@ -1695,17 +1829,30 @@ function renderHabitTimeline(detail) {
 }
 
 function selectedHabitSlotHtml(detail) {
-  if (!selectedHabitSlot) return `<p class="small">点击时间格查看对应 15 分钟的活动、待机和观测比例。</p>`;
+  if (!selectedHabitHour) return `<p class="small">点击一个小时查看其中四个 15 分钟时间片。</p>`;
+  const selectedDate = selectedHabitHour.date;
+  const selectedHourStart = selectedHabitHour.hour * 4;
+  if (!selectedHabitSlot || selectedHabitSlot.date !== selectedDate || Math.floor(selectedHabitSlot.slot / 4) !== selectedHabitHour.hour) {
+    selectedHabitSlot = { date: selectedDate, slot: selectedHourStart };
+  }
   const day = selectedHabitSlot.date === 0
     ? { slots: detail.summarySlots || [] }
     : (detail.days || []).find((item) => Number(item.date) === Number(selectedHabitSlot.date));
   const slot = day?.slots?.find((item) => Number(item.slot) === Number(selectedHabitSlot.slot));
   return `
     <div class="habit-slot-detail">
-      <strong>${habitDateLabel(selectedHabitSlot.date)} · ${habitSlotRange(selectedHabitSlot.slot)}</strong>
+      <strong>${habitDateLabel(selectedDate)} · ${String(selectedHabitHour.hour).padStart(2, "0")}:00-${String(selectedHabitHour.hour + 1).padStart(2, "0")}:00</strong>
+      <div class="habit-quarter-choices">
+        ${Array.from({ length: 4 }, (_, quarter) => {
+          const index = selectedHourStart + quarter;
+          return `<button class="habit-quarter-choice ${selectedHabitSlot.slot === index ? "active" : ""}" data-habit-quarter="${index}">${habitSlotRange(index)}</button>`;
+        }).join("")}
+      </div>
+      <div class="habit-quarter-values">
       <span>活动 ${Number(slot?.activePct || 0)}%</span>
       <span>待机 ${Number(slot?.standbyPct || 0)}%</span>
       <span>有效观测 ${Number(slot?.observedPct || 0)}%</span>
+      </div>
     </div>
   `;
 }
@@ -1761,9 +1908,13 @@ function renderHabit() {
           <div><span>待机时长</span><strong>${formatDuration(detail.sessionStats?.standbySec || 0)}</strong></div>
           <div><span>会话电量</span><strong>${(Number(detail.sessionStats?.energyWh || 0) / 1000).toFixed(3)}kWh</strong></div>
         </div>
+        <div class="habit-view-filters" aria-label="习惯时间带筛选">
+          ${[["all", "全天"], ["active", "仅活动"], ["standby", "仅待机"], ["evening", "晚间"]].map(([value, label]) => `<button class="btn habit-view-filter ${habitViewFilter === value ? "primary" : ""}" data-habit-view="${value}">${label}</button>`).join("")}
+        </div>
         ${renderHabitTimeline(detail)}
         ${selectedHabitSlotHtml(detail)}
         <div class="habit-legend"><span><i class="active-high"></i>活动</span><span><i class="standby"></i>待机</span><span><i class="idle"></i>未使用</span><span><i class="insufficient"></i>观测不足</span><span><i class="live"></i>当前运行</span></div>
+        <p class="small habit-updated-at">数据更新：${formatBeijingTime(detail.updatedAt, "等待首次同步")}${offlineCache ? " · 离线缓存" : ""}</p>
       ` : profiles.length ? `<div class="empty-state">${store.behaviorLoading ? "正在加载 7 天习惯..." : "等待板端习惯数据"}</div>` : ""}
     </section>
     <section class="card">
@@ -1790,7 +1941,7 @@ function renderHome() {
         <span class="small">${RANGE_LABELS[store.telemetryRange] || store.telemetryRange}</span>
       </div>
       ${telemetryRangeSelector()}
-      ${telemetryChart({ compact: true })}
+      <div id="telemetryLiveRegion">${telemetryChart({ compact: true })}</div>
     </section>
     ${renderRecentReminders(3)}
     ${renderQuickActions()}
@@ -1961,8 +2112,8 @@ function renderPrefToggle(key, label, desc) {
 
 function renderMe() {
   const d = selectedDevice();
-  const usageKwh = calcUsageKwhFromTelemetry();
-  const weeklyKwh = Number((usageKwh * 7).toFixed(2));
+  const sevenDayStats = store.behaviorOverview?.sevenDayStats || {};
+  const installed = window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone === true;
   const mailStatus = !mailPreference.loaded
     ? "加载中..."
     : !mailPreference.smtpConfigured
@@ -1997,10 +2148,17 @@ function renderMe() {
     </section>
     <section class="card">
       <h3>用电概览</h3>
-      <p class="small">当前区间估算用电：${usageKwh} kWh</p>
-      <p class="small">近一周粗略估算：${weeklyKwh} kWh</p>
-      <p class="small">最近行为事件：${(store.behaviorEvents || []).length} 条</p>
+      <p class="small">近 7 天真实会话：${Number(sevenDayStats.sessionCount || 0)} 次</p>
+      <p class="small">活动 ${formatDuration(sevenDayStats.activeSec || 0)} · 待机 ${formatDuration(sevenDayStats.standbySec || 0)}</p>
+      <p class="small">真实会话电量：${(Number(sevenDayStats.energyWh || 0) / 1000).toFixed(3)} kWh</p>
     </section>
+    ${installed ? "" : `
+      <section class="card install-card">
+        <h3>安装到手机</h3>
+        <p class="small">安装后可从桌面直接打开，并在离线时查看最后缓存的真实数据。</p>
+        <button id="installPwaBtn" class="btn primary" ${deferredInstallPrompt ? "" : "disabled"}>${deferredInstallPrompt ? "安装 Dorm Power" : "请使用浏览器菜单添加到主屏幕"}</button>
+      </section>
+    `}
     <section class="card">
       <h3>帮助中心</h3>
       <details><summary>为什么显示 Unknown？</summary><p class="small">表示系统暂时无法确认接入设备类型。请确认设备是否正常，并在插孔页提交设备类型帮助系统学习。</p></details>
@@ -2062,6 +2220,7 @@ function bindLogin() {
       showToast("登录成功");
       connectWs();
       await bootstrapData();
+      scheduleStatusPolling();
     } catch (e) {
       if (handleAuthExpired(e)) return;
       addAlert("SYSTEM", `登录失败：${e.message}`, "err");
@@ -2197,6 +2356,7 @@ function bindActions() {
       store.selectedHabitProfileId = profileId;
       store.habitDetail = null;
       selectedHabitSlot = null;
+      selectedHabitHour = null;
       lastHabitRefreshAt = 0;
       persistBehaviorState();
       render();
@@ -2205,9 +2365,25 @@ function bindActions() {
     });
   });
 
-  document.querySelectorAll(".habit-slot").forEach((btn) => {
+  document.querySelectorAll(".habit-hour").forEach((btn) => {
     btn.addEventListener("click", () => {
-      selectedHabitSlot = { date: Number(btn.dataset.habitDate), slot: Number(btn.dataset.habitSlot) };
+      selectedHabitHour = { date: Number(btn.dataset.habitDate), hour: Number(btn.dataset.habitHour) };
+      selectedHabitSlot = { date: selectedHabitHour.date, slot: selectedHabitHour.hour * 4 };
+      render();
+    });
+  });
+
+  document.querySelectorAll(".habit-quarter-choice").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!selectedHabitHour) return;
+      selectedHabitSlot = { date: selectedHabitHour.date, slot: Number(btn.dataset.habitQuarter) };
+      render();
+    });
+  });
+
+  document.querySelectorAll(".habit-view-filter").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      habitViewFilter = btn.dataset.habitView || "all";
       render();
     });
   });
@@ -2473,6 +2649,18 @@ function bindActions() {
     };
   }
 
+  const installPwaBtn = document.getElementById("installPwaBtn");
+  if (installPwaBtn && deferredInstallPrompt) {
+    installPwaBtn.onclick = async () => {
+      const promptEvent = deferredInstallPrompt;
+      deferredInstallPrompt = null;
+      await promptEvent.prompt();
+      const result = await promptEvent.userChoice;
+      showToast(result.outcome === "accepted" ? "已开始安装" : "已取消安装");
+      render();
+    };
+  }
+
   const logoutBtn = document.getElementById("logoutBtn");
   if (logoutBtn) {
     logoutBtn.onclick = () => {
@@ -2515,53 +2703,101 @@ function render() {
         <button id="resetAppBtn" class="btn danger">清除缓存并重试</button>
       </section>
     `;
-    document.getElementById("resetAppBtn")?.addEventListener("click", () => {
+    document.getElementById("resetAppBtn")?.addEventListener("click", async () => {
+      await clearBehaviorCache();
       localStorage.clear();
       window.location.reload();
     });
   }
 }
 
-function startStatusPolling() {
-  if (statusPollTimer) return;
-  statusPollTimer = setInterval(async () => {
-    if (!store.token || !store.selectedDeviceId || statusPolling) return;
-    if (document.hidden || !navigator.onLine) return;
-    statusPolling = true;
-    try {
-      store.deviceStatus = await getDeviceStatus(store.selectedDeviceId, store.token);
-      await refreshTelemetryIfNeeded(false);
-      await refreshSupplementIfNeeded(false);
-      await refreshBehaviorOverview(false);
-      if (currentTab === "habit") await refreshHabitDetail(false);
-      updateBadge();
-      safeRender();
-    } catch (err) {
-      if (handleAuthExpired(err)) return;
-    } finally {
-      statusPolling = false;
+function statusPollDelay() {
+  if (store.wsConnected) return STATUS_POLL_CONNECTED_MS;
+  return Math.min(60000, STATUS_POLL_DISCONNECTED_MS * 2 ** Math.min(statusPollFailureCount, 3));
+}
+
+function scheduleStatusPolling(delayMs = statusPollDelay()) {
+  if (statusPollTimer) window.clearTimeout(statusPollTimer);
+  statusPollTimer = window.setTimeout(() => {
+    statusPollTimer = null;
+    runStatusPoll().catch(() => undefined);
+  }, Math.max(0, delayMs));
+}
+
+async function runStatusPoll({ force = false } = {}) {
+  if (!store.token || !store.selectedDeviceId || !navigator.onLine) return;
+  if (statusPolling || document.hidden) {
+    scheduleStatusPolling();
+    return;
+  }
+  statusPolling = true;
+  const deviceId = store.selectedDeviceId;
+  try {
+    const now = Date.now();
+    if (force || now - lastStatusRefreshAt >= statusPollDelay()) {
+      const status = await getDeviceStatus(deviceId, store.token);
+      if (deviceId !== store.selectedDeviceId) return;
+      store.deviceStatus = status;
+      lastStatusRefreshAt = Date.now();
     }
-  }, STATUS_POLL_INTERVAL_MS);
+    statusPollFailureCount = 0;
+    await refreshTelemetryIfNeeded(force && !store.wsConnected);
+    await refreshSupplementIfNeeded(false);
+    await refreshBehaviorOverview(false);
+    if (currentTab === "habit") await refreshHabitDetail(false);
+    updateBadge();
+    if (store.wsConnected) updateRealtimeDom("REST_CALIBRATION");
+    else safeRender();
+  } catch (err) {
+    statusPollFailureCount += 1;
+    if (handleAuthExpired(err)) return;
+  } finally {
+    statusPolling = false;
+    if (store.token && store.selectedDeviceId && navigator.onLine) scheduleStatusPolling();
+  }
+}
+
+function startStatusPolling() {
+  scheduleStatusPolling(0);
 }
 
 function bindGlobalListeners() {
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (currentTab === "me") safeRender();
+  });
+
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    showToast("Dorm Power 已安装");
+    if (currentTab === "me") safeRender();
+  });
+
   window.addEventListener("online", async () => {
     setBanner("");
     updateBadge();
     if (store.token) {
       connectWs();
       await bootstrapData();
+      scheduleStatusPolling();
     }
   });
 
   window.addEventListener("offline", () => {
     setBanner("当前网络不可用，请检查连接");
     updateBadge();
+    if (statusPollTimer) window.clearTimeout(statusPollTimer);
+    statusPollTimer = null;
   });
 
   document.addEventListener("visibilitychange", async () => {
     if (!document.hidden && store.token && store.selectedDeviceId) {
-      await bootstrapData();
+      const stale = Date.now() - lastStatusRefreshAt >= statusPollDelay();
+      await runStatusPoll({ force: stale });
+      if (currentTab === "habit") {
+        await Promise.all([refreshBehaviorOverview(false), refreshHabitDetail(false)]);
+      }
     }
   });
 
@@ -2632,6 +2868,7 @@ init().catch((err) => {
   if (resetBtn) {
     resetBtn.addEventListener("click", async () => {
       try {
+        await clearBehaviorCache();
         localStorage.clear();
         if ("serviceWorker" in navigator) {
           const regs = await navigator.serviceWorker.getRegistrations();
@@ -2652,12 +2889,37 @@ function isLocalDevHost() {
   return window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
 }
 
+function showServiceWorkerUpdate(worker) {
+  pendingServiceWorker = worker;
+  updateBanner?.classList.remove("hidden");
+}
+
+applyUpdateBtn?.addEventListener("click", () => {
+  if (!pendingServiceWorker) return;
+  applyUpdateBtn.disabled = true;
+  applyUpdateBtn.textContent = "正在更新...";
+  pendingServiceWorker.postMessage({ type: "SKIP_WAITING" });
+});
+
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     if (isLocalDevHost()) {
       navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((reg) => reg.unregister())).catch(() => null);
       return;
     }
-    navigator.serviceWorker.register("./sw.js?v=20260809a").catch(() => null);
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (serviceWorkerReloading) return;
+      serviceWorkerReloading = true;
+      window.location.reload();
+    });
+    navigator.serviceWorker.register("./sw.js?v=20260809b").then((registration) => {
+      if (registration.waiting) showServiceWorkerUpdate(registration.waiting);
+      registration.addEventListener("updatefound", () => {
+        const worker = registration.installing;
+        worker?.addEventListener("statechange", () => {
+          if (worker.state === "installed" && navigator.serviceWorker.controller) showServiceWorkerUpdate(worker);
+        });
+      });
+    }).catch(() => null);
   });
 }

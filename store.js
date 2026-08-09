@@ -42,8 +42,79 @@ export const store = {
   debugMode: localStorage.getItem("dp_debug_mode") === "1",
 };
 
+const BEHAVIOR_DB_NAME = "dorm-power-pwa";
+const BEHAVIOR_DB_VERSION = 1;
+const BEHAVIOR_STORE_NAME = "behavior_snapshots";
+const BEHAVIOR_CACHE_SCHEMA = 1;
+
 function behaviorCacheKey(username, deviceId) {
   return `dp_behavior_cache:${String(username || "anonymous")}:${String(deviceId || "none")}`;
+}
+
+function openBehaviorDb() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in globalThis)) {
+      reject(new Error("IndexedDB unavailable"));
+      return;
+    }
+    const request = indexedDB.open(BEHAVIOR_DB_NAME, BEHAVIOR_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(BEHAVIOR_STORE_NAME)) {
+        db.createObjectStore(BEHAVIOR_STORE_NAME, { keyPath: "key" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+  });
+}
+
+async function readBehaviorDb(key) {
+  const db = await openBehaviorDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(BEHAVIOR_STORE_NAME, "readonly").objectStore(BEHAVIOR_STORE_NAME).get(key);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error || new Error("IndexedDB read failed"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function writeBehaviorDb(record) {
+  const db = await openBehaviorDb();
+  try {
+    await new Promise((resolve, reject) => {
+      const request = db.transaction(BEHAVIOR_STORE_NAME, "readwrite").objectStore(BEHAVIOR_STORE_NAME).put(record);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error || new Error("IndexedDB write failed"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteBehaviorDbPrefix(prefix) {
+  const db = await openBehaviorDb();
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(BEHAVIOR_STORE_NAME, "readwrite");
+      const storeRef = transaction.objectStore(BEHAVIOR_STORE_NAME);
+      const request = storeRef.openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if (String(cursor.key).startsWith(prefix)) cursor.delete();
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error || new Error("IndexedDB cursor failed"));
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error || new Error("IndexedDB delete failed"));
+    });
+  } finally {
+    db.close();
+  }
 }
 
 export function setCurrentUser(user) {
@@ -52,8 +123,23 @@ export function setCurrentUser(user) {
   else localStorage.removeItem("dp_user");
 }
 
-export function loadBehaviorCache(username, deviceId) {
-  const cached = readJson(behaviorCacheKey(username, deviceId), null);
+export async function loadBehaviorCache(username, deviceId) {
+  const key = behaviorCacheKey(username, deviceId);
+  let cached = null;
+  try {
+    const record = await readBehaviorDb(key);
+    if (record?.schemaVersion === BEHAVIOR_CACHE_SCHEMA) cached = record.payload;
+  } catch {
+    // Older browsers continue using the localStorage fallback.
+  }
+  if (!cached) {
+    cached = readJson(key, null);
+    if (cached) {
+      writeBehaviorDb({ key, schemaVersion: BEHAVIOR_CACHE_SCHEMA, payload: cached, savedAt: cached.savedAt || Date.now() })
+        .then(() => localStorage.removeItem(key))
+        .catch(() => undefined);
+    }
+  }
   if (!cached) return false;
   store.behaviorOverview = cached.overview || null;
   store.habitProfiles = Array.isArray(cached.overview?.profiles) ? cached.overview.profiles : [];
@@ -65,22 +151,26 @@ export function loadBehaviorCache(username, deviceId) {
   return true;
 }
 
-export function saveBehaviorCache(username, deviceId) {
+export async function saveBehaviorCache(username, deviceId) {
   if (!username || !deviceId) return;
-  localStorage.setItem(
-    behaviorCacheKey(username, deviceId),
-    JSON.stringify({
-      overview: store.behaviorOverview,
-      selectedHabitProfileId: store.selectedHabitProfileId,
-      habitDetail: store.habitDetail,
-      sessions: store.behaviorSessions.slice(0, 40),
-      sessionCursor: store.sessionCursor,
-      savedAt: Date.now(),
-    }),
-  );
+  const key = behaviorCacheKey(username, deviceId);
+  const payload = {
+    overview: store.behaviorOverview,
+    selectedHabitProfileId: store.selectedHabitProfileId,
+    habitDetail: store.habitDetail,
+    sessions: store.behaviorSessions.slice(0, 40),
+    sessionCursor: store.sessionCursor,
+    savedAt: Date.now(),
+  };
+  try {
+    await writeBehaviorDb({ key, schemaVersion: BEHAVIOR_CACHE_SCHEMA, payload, savedAt: payload.savedAt });
+    localStorage.removeItem(key);
+  } catch {
+    localStorage.setItem(key, JSON.stringify(payload));
+  }
 }
 
-export function clearBehaviorCache(username = "") {
+export async function clearBehaviorCache(username = "") {
   const prefix = username ? `dp_behavior_cache:${String(username)}:` : "dp_behavior_cache:";
   Object.keys(localStorage).forEach((key) => {
     if (key.startsWith(prefix)) localStorage.removeItem(key);
@@ -95,6 +185,11 @@ export function clearBehaviorCache(username = "") {
   store.behaviorLoading = false;
   store.behaviorError = "";
   store.behaviorLastUpdatedAt = 0;
+  try {
+    await deleteBehaviorDbPrefix(prefix);
+  } catch {
+    // localStorage cleanup still provides a safe fallback.
+  }
 }
 
 export function addEvent(type, detail, level = "info") {
